@@ -4,11 +4,10 @@ import { Download, Upload, FileSpreadsheet, CheckCircle2, AlertTriangle } from '
 import { supabase } from '@/lib/supabase';
 import { Modal } from '@/components/Modal';
 import { useToast } from '@/components/Toast';
+import { SOURCE_CODES, McRate } from '@/lib/mclGrid';
+import { rowTrips, tripPayload } from '@/lib/mclTripRows';
 import {
-  TRIP_NUMS, SOURCE_CODES, buildNotes, freeNotes, dayTotals, McRate,
-} from '@/lib/mclGrid';
-import {
-  Lookup, ImportResult, TripImportRow, FuelImportRow, validateTrips, validateFuel, deriveFromTo,
+  Lookup, ImportResult, TripImportRow, FuelImportRow, validateTrips, validateFuel,
   TRIP_TEMPLATE_HEADERS, FUEL_TEMPLATE_HEADERS, tripTemplateExamples, fuelTemplateExamples,
 } from '@/lib/mclImport';
 import { syncFuelMirror } from '@/lib/mclFuelSync';
@@ -25,21 +24,20 @@ export function downloadMclTemplate(kind: ImportKind, lk: Pick<Lookup, 'vehicles
   const headers = kind === 'trips' ? TRIP_TEMPLATE_HEADERS : FUEL_TEMPLATE_HEADERS;
   const examples = kind === 'trips' ? tripTemplateExamples(plate, driver) : fuelTemplateExamples(plate);
   const sheet = XLSX.utils.aoa_to_sheet([headers, ...examples]);
-  sheet['!cols'] = headers.map((h, i) => ({ wch: i < 5 ? 14 : kind === 'trips' && (i - 5) % 4 >= 2 ? 16 : 11 }));
+  sheet['!cols'] = headers.map(() => ({ wch: 16 }));
   XLSX.utils.book_append_sheet(wb, sheet, kind === 'trips' ? 'MCL Trips' : 'MCL Fuel');
 
   const help: (string | number)[][] =
     kind === 'trips'
       ? [
           ['HOW TO FILL THIS IN'],
-          ['One row per truck per day. Delete the two example rows first.'],
+          ['One row per TRIP. A truck can have as many rows (trips) on the same day as it needs, each with its own driver. Delete the example rows first.'],
           ['date', 'yyyy-mm-dd (for example 2026-11-01) or dd/mm/yyyy'],
           ['truck', 'Plate number exactly as in Trucks / Vehicles'],
-          ['driver', 'Optional. Name exactly as in Drivers'],
-          ['from, to', 'Optional. Used for every trip of that day that has no from/to of its own. Left blank, they are filled from the material source (for example M gives MCL MINES to CRUSHER)'],
-          ['trip_N_kg', 'Weight of trip N in KG (up to 13 trips). Leave blank when there is no trip'],
-          ['trip_N_src', 'Material source of trip N. Blank means M'],
-          ['trip_N_from, trip_N_to', 'Optional. Where trip N loaded and where it delivered. Use this when trips of the same day go to different places. Blank = the day\'s from/to, or the material source route'],
+          ['driver', 'The driver who did THIS trip. Name exactly as in Drivers. Blank = no driver'],
+          ['kg', 'Weight of the trip in KG'],
+          ['source', 'Material source letter of the trip. Blank means M'],
+          ['from, to', 'Optional. Where the trip loaded and delivered. Left blank, they are filled from the material source (for example M gives MCL MINES to CRUSHER)'],
           [],
           ['Material source', 'Material', 'To', 'Rate / ton', 'Fuel L / trip'],
           ...SOURCE_CODES.map(c => {
@@ -47,7 +45,7 @@ export function downloadMclTemplate(kind: ImportKind, lk: Pick<Lookup, 'vehicles
             return [c, r?.name ?? '', r?.destination ?? '', r?.rate_per_ton ?? '', r?.fuel_litres ?? ''];
           }),
           [],
-          ['If a truck already has a record for that date, the import replaces its trips.'],
+          ['Trips are added to what is already saved. A trip identical to one already saved (same truck, date, driver, KG and source) is skipped, so importing the same file twice does not duplicate it.'],
         ]
       : [
           ['HOW TO FILL THIS IN'],
@@ -79,48 +77,37 @@ const monthOf = (date: string) => date.slice(0, 7);
 async function importTrips(rows: TripImportRow[], rates: McRate[]) {
   const ids = [...new Set(rows.map(r => r.vehicle_id))];
   const dates = rows.map(r => r.date).sort();
-  const existing = await supabase.from('mcl_trips').select('id, vehicle_id, trip_date, notes')
+  const existing = await supabase.from('mcl_trips').select('*')
     .in('vehicle_id', ids).gte('trip_date', dates[0]).lte('trip_date', dates[dates.length - 1]);
   if (existing.error) throw existing.error;
 
-  const byKey = new Map<string, any>();
+  // trips already saved, counted per (truck, date, driver, kg, source): an identical trip in the file uses one up
+  const sig = (v: string, d: string, drv: string | null, kg: number, src: string) => `${v}|${d}|${drv ?? ''}|${kg}|${src}`;
+  const have = new Map<string, number>();
   for (const e of existing.data || []) {
-    const k = `${e.vehicle_id}|${String(e.trip_date).slice(0, 10)}`;
-    if (!byKey.has(k)) byKey.set(k, e);
+    for (const t of rowTrips(e)) {
+      const k = sig(t.vehicle_id, t.trip_date, t.driver_id, t.kg, t.source);
+      have.set(k, (have.get(k) || 0) + 1);
+    }
   }
 
   const inserts: any[] = [];
-  const updates: { id: string; payload: any }[] = [];
+  let duplicates = 0;
   for (const r of rows) {
-    const hit = byKey.get(`${r.vehicle_id}|${r.date}`);
-    const totals = dayTotals({ weights: r.weights, sources: r.sources }, r.date, rates);
-    const ft = deriveFromTo(r, rates);
-    const payload: any = {
-      vehicle_id: r.vehicle_id,
-      trip_date: r.date,
-      status: 'completed',
-      net_tallage: Number(totals.tons.toFixed(3)),
-      notes: buildNotes(r.weights, r.sources, hit ? freeNotes(hit.notes) : ''),
-      departure_point: ft.from || null,
-      destination: ft.to || null,
-      trip_legs: Object.fromEntries(Object.entries(r.legs).map(([k, v]) => [k, v])),
-    };
-    if (r.driver_id) payload.driver_id = r.driver_id;
-    TRIP_NUMS.forEach(n => { payload[`trip_${n}`] = r.weights[n] || 0; });
-    if (hit) updates.push({ id: hit.id, payload }); else inserts.push(payload);
+    const k = sig(r.vehicle_id, r.date, r.driver_id, r.kg, r.source);
+    const left = have.get(k) || 0;
+    if (left > 0) { have.set(k, left - 1); duplicates++; continue; }
+    inserts.push(tripPayload({
+      vehicle_id: r.vehicle_id, driver_id: r.driver_id, trip_date: r.date,
+      kg: r.kg, source: r.source, from: r.from, to: r.to, notes: '',
+    }, rates));
   }
 
-  let failed = 0;
-  if (inserts.length) {
-    const { error } = await supabase.from('mcl_trips').insert(inserts);
+  for (let i = 0; i < inserts.length; i += 200) {
+    const { error } = await supabase.from('mcl_trips').insert(inserts.slice(i, i + 200));
     if (error) throw error;
   }
-  for (let i = 0; i < updates.length; i += 10) {
-    const res = await Promise.all(updates.slice(i, i + 10).map(u => supabase.from('mcl_trips').update(u.payload).eq('id', u.id)));
-    failed += res.filter(x => x.error).length;
-  }
-  if (failed) throw new Error(`${failed} existing day(s) could not be updated`);
-  return { inserted: inserts.length, updated: updates.length };
+  return { inserted: inserts.length, duplicates };
 }
 
 async function importFuel(rows: FuelImportRow[]) {
@@ -196,7 +183,7 @@ export function MclImportModal({
       let message: string;
       if (kind === 'trips') {
         const r = await importTrips(result.rows as TripImportRow[], lookup.rates);
-        message = `${r.inserted} new and ${r.updated} updated truck-day(s) imported`;
+        message = `${r.inserted} trip(s) imported${r.duplicates ? `, ${r.duplicates} already saved (skipped)` : ''}`;
       } else {
         const r = await importFuel(result.rows as FuelImportRow[]);
         message = `${r.saved} fuel day(s) imported${r.openings ? `, ${r.openings} opening balance(s)` : ''}`;
@@ -228,7 +215,7 @@ export function MclImportModal({
           <p className="font-semibold text-slate-800 mb-1">1. Get the template</p>
           <p className="text-xs mb-2">
             {kind === 'trips'
-              ? 'One row per truck per day: date, truck, driver, from, to, then trip 1 to 13 each with KG, material source, and its own from and to (optional).'
+              ? 'One row per trip: date, truck, driver, KG, material source, and from / to (optional). Add as many trips per day as you need, each with its own driver.'
               : 'One row per truck per day: date, truck, fuel 1, 2, 3, actual balance and (first day of the month only) opening balance.'}
           </p>
           <button onClick={() => downloadMclTemplate(kind, lookup)} className="btn-secondary flex items-center gap-2">
@@ -249,7 +236,7 @@ export function MclImportModal({
           <div className="rounded-xl border border-slate-200 p-4 space-y-3">
             <p className="font-semibold text-slate-800 text-sm">3. Check and import</p>
             <div className="flex flex-wrap gap-4 text-sm">
-              <span className="flex items-center gap-1 text-emerald-700 font-semibold"><CheckCircle2 className="h-4 w-4" /> {result.rows.length} row(s) ready</span>
+              <span className="flex items-center gap-1 text-emerald-700 font-semibold"><CheckCircle2 className="h-4 w-4" /> {result.rows.length} {kind === 'trips' ? 'trip(s)' : 'row(s)'} ready</span>
               {errs.length > 0 && <span className="flex items-center gap-1 text-red-600 font-semibold"><AlertTriangle className="h-4 w-4" /> {errs.length} row(s) with problems (will be skipped)</span>}
               {result.skipped > 0 && <span className="text-slate-500">{result.skipped} empty row(s) ignored</span>}
             </div>
@@ -275,7 +262,7 @@ export function MclImportModal({
                     <tr>
                       <th>Date</th><th>Truck</th>
                       {kind === 'trips'
-                        ? <><th className="text-right">Trips</th><th className="text-right">Tons</th></>
+                        ? <><th>Driver</th><th className="text-right">KG</th><th>Source</th></>
                         : <><th className="text-right">Fuel added (L)</th><th className="text-right">Actual bal</th></>}
                     </tr>
                   </thead>
@@ -285,8 +272,7 @@ export function MclImportModal({
                         <td>{r.date}</td><td className="font-semibold">{r.plate}</td>
                         {kind === 'trips' ? (() => {
                           const t = r as TripImportRow;
-                          const w = Object.values(t.weights);
-                          return <><td className="text-right">{w.length}</td><td className="text-right">{(w.reduce((a, b) => a + b, 0) / 1000).toFixed(2)}</td></>;
+                          return <><td>{t.driver_name || '—'}</td><td className="text-right">{t.kg.toLocaleString()}</td><td>{t.source}</td></>;
                         })() : (() => {
                           const f = r as FuelImportRow;
                           return <><td className="text-right">{(f.fuel1 || 0) + (f.fuel2 || 0) + (f.fuel3 || 0)}</td><td className="text-right">{f.actualBalance ?? ''}</td></>;
@@ -298,7 +284,7 @@ export function MclImportModal({
                 {result.rows.length > 10 && <p className="p-2 text-[11px] text-slate-400">Showing the first 10 of {result.rows.length}.</p>}
               </div>
             )}
-            <p className="text-[11px] text-slate-500">A truck-day that already has a record is replaced by the file's values.</p>
+            <p className="text-[11px] text-slate-500">{kind === 'trips' ? 'Trips are added to what is saved; a trip identical to one already saved is skipped.' : 'A truck-day that already has a record is replaced by the file\'s values.'}</p>
           </div>
         )}
       </div>
@@ -306,7 +292,7 @@ export function MclImportModal({
       <div className="mt-5 flex justify-end gap-2 border-t pt-3">
         <button onClick={close} className="btn-secondary">Cancel</button>
         <button onClick={run} disabled={busy || !result || result.rows.length === 0} className="btn-primary disabled:opacity-50">
-          {busy ? 'Importing…' : result ? `Import ${result.rows.length} row(s)` : 'Import'}
+          {busy ? 'Importing…' : result ? `Import ${result.rows.length} ${kind === 'trips' ? 'trip(s)' : 'row(s)'}` : 'Import'}
         </button>
       </div>
     </Modal>
