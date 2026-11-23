@@ -1,7 +1,7 @@
 // Parsing + validation for the MCL bulk imports (trips and fuel). Pure functions: the spreadsheet is read
 // elsewhere (MclImportModal) and handed in as plain row objects, so this file has no spreadsheet or database code.
 
-import { TRIP_NUMS, SOURCE_CODES, McRate, rateFor } from '@/lib/mclGrid';
+import { SOURCE_CODES, McRate } from '@/lib/mclGrid';
 
 export type Lookup = {
   vehicles: { id: string; plate_number: string }[];
@@ -11,17 +11,18 @@ export type Lookup = {
 
 export type RowError = { line: number; message: string };
 
+// One row = ONE trip (its own driver). A day with 5 trips is 5 rows; there is no limit.
 export type TripImportRow = {
   line: number;
   date: string;
   vehicle_id: string;
   plate: string;
   driver_id: string | null;
-  weights: Record<number, number>;
-  sources: Record<number, string>;
-  from: string;                                      // day-level From (fallback for trips with no own From)
-  to: string;                                        // day-level To
-  legs: Record<number, { from: string; to: string }>; // per-trip From/To typed in the file (blank = default from the source)
+  driver_name: string;
+  kg: number;
+  source: string;
+  from: string;   // blank = the route of the material source
+  to: string;
 };
 
 export type FuelImportRow = {
@@ -100,10 +101,13 @@ function findVehicle(n: Record<string, any>, lk: Lookup) {
 const allBlank = (n: Record<string, any>) => Object.values(n).every(isBlank);
 
 // ---------------------------------------------------------------- trips
+// Two layouts are accepted:
+//  1. One row per trip (the template): date, truck, driver, kg, source, from, to.
+//  2. The older "wide" layout (and the monthly workbook): one row per truck-day with trip_N_kg / trip_N_src /
+//     trip_N_from / trip_N_to columns, for any N. Each filled trip becomes its own trip, with the row's driver.
 export function validateTrips(raw: Record<string, any>[], lk: Lookup): ImportResult<TripImportRow> {
   const rows: TripImportRow[] = [];
   const errors: RowError[] = [];
-  const seen = new Map<string, number>();
   let skipped = 0;
 
   raw.forEach((r, i) => {
@@ -121,70 +125,67 @@ export function validateTrips(raw: Record<string, any>[], lk: Lookup): ImportRes
     if ('error' in found) return fail(found.error!);
     const vehicle = found.vehicle!;
 
-    const dupKey = `${vehicle.id}|${date}`;
-    if (seen.has(dupKey)) return fail(`Same truck and date already on line ${seen.get(dupKey)}`);
-
-    const weights: Record<number, number> = {};
-    const sources: Record<number, string> = {};
-    let bad = '';
-    for (const k of TRIP_NUMS) {
-      const wRaw = pick(n, `trip_${k}_kg`, `trip_${k}`, `trip${k}_kg`, `trip${k}`, `kg_${k}`);
-      const w = toNum(wRaw);
-      if (w === null) continue;
-      if (Number.isNaN(w) || w < 0) { bad = `Trip ${k}: "${wRaw}" is not a valid weight in KG`; break; }
-      if (w === 0) continue;
-      const src = String(pick(n, `trip_${k}_src`, `trip_${k}_source`, `src_${k}`, `source_${k}`) ?? 'M').toUpperCase();
-      if (!(SOURCE_CODES as readonly string[]).includes(src)) { bad = `Trip ${k}: source "${src}" must be one of ${SOURCE_CODES.join(', ')}`; break; }
-      weights[k] = w;
-      sources[k] = src;
-    }
-    if (bad) return fail(bad);
-
-    if (Object.keys(weights).length === 0) { skipped++; return; } // no trips that day: nothing to import
-
     let driver_id: string | null = null;
+    let driver_name = '';
     const drv = pick(n, 'driver', 'driver_name');
     if (drv !== undefined) {
       const d = lk.drivers.find(x => x.name.trim().toLowerCase() === String(drv).trim().toLowerCase());
       if (!d) return fail(`Driver "${drv}" is not in Drivers`);
-      driver_id = d.id;
+      driver_id = d.id; driver_name = d.name;
     }
 
     const dayFrom = String(pick(n, 'from', 'departure_point', 'origin') ?? '');
     const dayTo = String(pick(n, 'to', 'destination', 'to_destination') ?? '');
 
-    // per-trip From/To: trip_N_from / trip_N_to, falling back to the day's from / to
-    const legs: Record<number, { from: string; to: string }> = {};
-    for (const k of TRIP_NUMS) {
-      if (!weights[k]) continue;
-      const f = String(pick(n, `trip_${k}_from`, `from_${k}`, `trip${k}_from`) ?? dayFrom);
-      const t = String(pick(n, `trip_${k}_to`, `to_${k}`, `trip${k}_to`) ?? dayTo);
-      if (f || t) legs[k] = { from: f, to: t };
+    const parseSource = (v: any, label: string) => {
+      const src = String(v ?? 'M').toUpperCase();
+      return (SOURCE_CODES as readonly string[]).includes(src) ? { src } : { error: `${label}: source "${src}" must be one of ${SOURCE_CODES.join(', ')}` };
+    };
+
+    const found_trips: TripImportRow[] = [];
+    let bad = '';
+
+    // layout 1: one trip on this row
+    const kgRaw = pick(n, 'kg', 'weight_kg', 'weight', 'net_weight_kg');
+    if (kgRaw !== undefined) {
+      const w = toNum(kgRaw);
+      if (w === null || Number.isNaN(w) || w < 0) bad = `"${kgRaw}" is not a valid weight in KG`;
+      else if (w > 0) {
+        const s = parseSource(pick(n, 'source', 'src', 'material_source', 'material'), 'Trip');
+        if ('error' in s) bad = s.error!;
+        else found_trips.push({ line, date, vehicle_id: vehicle.id, plate: vehicle.plate_number, driver_id, driver_name, kg: w, source: s.src, from: dayFrom, to: dayTo });
+      }
     }
 
-    seen.set(dupKey, line);
-    rows.push({
-      line, date, vehicle_id: vehicle.id, plate: vehicle.plate_number, driver_id, weights, sources,
-      from: dayFrom, to: dayTo, legs,
-    });
+    // layout 2: trip_N_kg columns (any N, no limit)
+    if (!bad) {
+      const nums = new Set<number>();
+      for (const k of Object.keys(n)) {
+        const m = /^(?:trip_?|kg_)(\d+)(?:_kg)?$/.exec(k) || /^trip_?(\d+)_kg$/.exec(k);
+        if (m) nums.add(Number(m[1]));
+      }
+      for (const k of [...nums].sort((a, b) => a - b)) {
+        const wRaw = pick(n, `trip_${k}_kg`, `trip_${k}`, `trip${k}_kg`, `trip${k}`, `kg_${k}`);
+        const w = toNum(wRaw);
+        if (w === null) continue;
+        if (Number.isNaN(w) || w < 0) { bad = `Trip ${k}: "${wRaw}" is not a valid weight in KG`; break; }
+        if (w === 0) continue;
+        const s = parseSource(pick(n, `trip_${k}_src`, `trip_${k}_source`, `src_${k}`, `source_${k}`), `Trip ${k}`);
+        if ('error' in s) { bad = s.error!; break; }
+        found_trips.push({
+          line, date, vehicle_id: vehicle.id, plate: vehicle.plate_number, driver_id, driver_name, kg: w, source: s.src,
+          from: String(pick(n, `trip_${k}_from`, `from_${k}`, `trip${k}_from`) ?? dayFrom),
+          to: String(pick(n, `trip_${k}_to`, `to_${k}`, `trip${k}_to`) ?? dayTo),
+        });
+      }
+    }
+    if (bad) return fail(bad);
+
+    if (found_trips.length === 0) { skipped++; return; } // no trips on this row: nothing to import
+    rows.push(...found_trips);
   });
 
   return { rows, errors, skipped };
-}
-
-// Each trip's From/To = what the file says for that trip, otherwise the route of its material source
-// (the same as on the Trips sheet). Returns the day summary (all different places joined with " / ").
-export function deriveFromTo(row: TripImportRow, rates: McRate[]) {
-  const from: string[] = [], to: string[] = [];
-  for (const k of TRIP_NUMS) {
-    if (!row.weights[k]) continue;
-    const r = rateFor(rates, row.sources[k], row.date);
-    const f = row.legs[k]?.from || r?.name || '';
-    const t = row.legs[k]?.to || r?.destination || '';
-    if (f && !from.includes(f)) from.push(f);
-    if (t && !to.includes(t)) to.push(t);
-  }
-  return { from: from.join(' / '), to: to.join(' / ') };
 }
 
 // ---------------------------------------------------------------- fuel
@@ -233,23 +234,17 @@ export function validateFuel(raw: Record<string, any>[], lk: Lookup): ImportResu
 }
 
 // ---------------------------------------------------------------- templates (rows written by the modal)
-export const TRIP_TEMPLATE_HEADERS = [
-  'date', 'truck', 'driver', 'from', 'to',
-  ...TRIP_NUMS.flatMap(n => [`trip_${n}_kg`, `trip_${n}_src`, `trip_${n}_from`, `trip_${n}_to`]),
-];
+export const TRIP_TEMPLATE_HEADERS = ['date', 'truck', 'driver', 'kg', 'source', 'from', 'to'];
 
 export const FUEL_TEMPLATE_HEADERS = ['date', 'truck', 'fuel_1', 'fuel_2', 'fuel_3', 'actual_balance', 'opening_balance'];
 
 export function tripTemplateExamples(plate: string, driver: string): (string | number)[][] {
-  const blank = (len: number) => Array(len).fill('');
-  const mk = (date: string, trips: [number, string, string?, string?][]) => {
-    const row: (string | number)[] = [date, plate, driver, '', ''];
-    TRIP_NUMS.forEach((_, i) => { row.push(trips[i]?.[0] ?? '', trips[i]?.[1] ?? '', trips[i]?.[2] ?? '', trips[i]?.[3] ?? ''); });
-    return row.length === TRIP_TEMPLATE_HEADERS.length ? row : [...row, ...blank(TRIP_TEMPLATE_HEADERS.length - row.length)];
-  };
+  // one row per trip; the same day can have as many rows as it has trips, each with its own driver
   return [
-    mk('2026-11-01', [[31220, 'M'], [30980, 'M'], [31450, 'G']]),
-    mk('2026-11-02', [[29800, 'N'], [30100, 'T', 'Vipingo', 'Mombasa']]),
+    ['2026-11-01', plate, driver, 31220, 'M', '', ''],
+    ['2026-11-01', plate, driver, 30980, 'M', '', ''],
+    ['2026-11-02', plate, driver, 29800, 'N', '', ''],
+    ['2026-11-02', plate, driver, 30100, 'T', 'Vipingo', 'Mombasa'],
   ];
 }
 
