@@ -1,48 +1,43 @@
-import { useEffect, useState, useCallback, useMemo } from 'react';
-import { Route as RouteIcon, Save, Settings2, Trash2, Plus, Download, Upload } from 'lucide-react';
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
+import { Route as RouteIcon, Save, Settings2, Trash2, Plus, Download, Upload, Undo2 } from 'lucide-react';
 import { supabase } from '@/lib/supabase';
 import { PageHeader } from '@/components/PageHeader';
 import { Modal } from '@/components/Modal';
 import { LoadingSpinner } from '@/components/Shared';
 import { MclImportModal, downloadMclTemplate } from '@/components/MclImportModal';
 import { syncFuelMirror } from '@/lib/mclFuelSync';
+import { rowTrips, tripPayload, splitLegacyRows, McTrip } from '@/lib/mclTripRows';
 import { useToast } from '@/components/Toast';
 import {
-  TRIP_NUMS, SOURCE_CODES, McRate, FuelOverride, rateFor, dayTotals, daysOfMonth, monthStart, currentMonth,
-  shortDay, parseSources, freeNotes, buildNotes, fmt,
+  SOURCE_CODES, McRate, FuelOverride, rateFor, dayTotals, daysOfMonth, monthStart, currentMonth, shortDay, fmt,
 } from '@/lib/mclGrid';
 
-// One row of the grid = one truck on one day (one mcl_trips record).
-type Row = {
-  id?: string;
+// One line of the sheet = ONE trip, with its own driver. A day can have any number of trips.
+type Line = {
+  key: string;            // stable React key
+  id?: string;            // mcl_trips record (absent = not saved yet)
+  date: string;
   driver_id: string;
-  weights: Record<number, string>; // KG, kept as strings while typing
-  sources: Record<number, string>;
-  notes: string;
-  legs: Record<number, { from: string; to: string }>; // per-trip From/To (blank = default from the trip's material source)
-  dup: number;                     // how many records already exist for this truck+date
+  kg: string;             // kept as a string while typing
+  src: string;
+  from: string;
+  to: string;
+  notes: string;          // free notes carried over from the saved record
   dirty: boolean;
+  removed: boolean;       // saved trip marked for deletion (applied on Save)
 };
 
-const emptyRow = (): Row => ({ driver_id: '', weights: {}, sources: {}, notes: '', legs: {}, dup: 0, dirty: false });
-
+let keySeq = 0;
+const newKey = () => `n${++keySeq}`;
 const num = (s: string | undefined) => Number(s) || 0;
+const blankLine = (date: string, driver_id = '', src = 'M'): Line => ({
+  key: newKey(), date, driver_id, kg: '', src, from: '', to: '', notes: '', dirty: true, removed: false,
+});
 
-function rowToDay(r: Row) {
-  const weights: Record<number, number> = {};
-  TRIP_NUMS.forEach(n => { weights[n] = num(r.weights[n]); });
-  return { weights, sources: r.sources };
-}
-
-function legsFromRow(raw: any): Row['legs'] {
-  const out: Row['legs'] = {};
-  if (raw && typeof raw === 'object') {
-    Object.entries(raw).forEach(([k, v]: [string, any]) => {
-      out[Number(k)] = { from: v?.from || '', to: v?.to || '' };
-    });
-  }
-  return out;
-}
+const toTrip = (l: Line, vehicle_id: string): McTrip => ({
+  id: l.id, vehicle_id, driver_id: l.driver_id || null, trip_date: l.date,
+  kg: num(l.kg), source: l.src || 'M', from: l.from, to: l.to, notes: l.notes,
+});
 
 export function MclTrips({ portalColor }: { portalColor: string }) {
   const { showToast } = useToast();
@@ -51,28 +46,27 @@ export function MclTrips({ portalColor }: { portalColor: string }) {
   const [vehicles, setVehicles] = useState<any[]>([]);
   const [drivers, setDrivers] = useState<any[]>([]);
   const [rates, setRates] = useState<McRate[]>([]);
+  const ratesRef = useRef<McRate[]>([]);
+  const [ready, setReady] = useState(false); // trucks, drivers and rates loaded
   const [override, setOverride] = useState<FuelOverride>({});
   const [vehicleId, setVehicleId] = useState('');
   const [month, setMonth] = useState(currentMonth());
-  const [rows, setRows] = useState<Record<string, Row>>({});
+  const [driverFilter, setDriverFilter] = useState('');
+  const [lines, setLines] = useState<Line[]>([]);
   const [ratesOpen, setRatesOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
-  const [routeDay, setRouteDay] = useState<string | null>(null);
 
-  // "Add Trip Record" form
-  type NewTrip = { kg: string; src: string; from: string; to: string };
-  const blankTrip = (): NewTrip => ({ kg: '', src: 'M', from: '', to: '' });
+  // "Add Trips" form: one date + truck, then any number of trips, each with its own driver
+  type NewTrip = { driver: string; kg: string; src: string; from: string; to: string };
+  const blankTrip = (driver = '', src = 'M'): NewTrip => ({ driver, kg: '', src, from: '', to: '' });
   const [addOpen, setAddOpen] = useState(false);
   const [addSaving, setAddSaving] = useState(false);
   const [addDate, setAddDate] = useState('');
   const [addVehicle, setAddVehicle] = useState('');
-  const [addDriver, setAddDriver] = useState('');
   const [addTrips, setAddTrips] = useState<NewTrip[]>([blankTrip()]);
-  const [defFrom, setDefFrom] = useState('');
-  const [defTo, setDefTo] = useState('');
 
   const days = useMemo(() => daysOfMonth(month), [month]);
-  const dirtyCount = useMemo(() => Object.values(rows).filter(r => r.dirty).length, [rows]);
+  const dirtyCount = useMemo(() => lines.filter(l => l.dirty && !(l.removed && !l.id) && (l.id || num(l.kg) > 0)).length, [lines]);
 
   // --- lookups (trucks, drivers, rates) ------------------------------------------------
   const loadLookups = useCallback(async () => {
@@ -83,93 +77,82 @@ export function MclTrips({ portalColor }: { portalColor: string }) {
     ]);
     setVehicles(veh.data || []);
     setDrivers(drv.data || []);
-    setRates((rt.data || []).map((r: any) => ({ ...r, rate_per_ton: Number(r.rate_per_ton), fuel_litres: Number(r.fuel_litres) })));
+    const parsed = (rt.data || []).map((r: any) => ({ ...r, rate_per_ton: Number(r.rate_per_ton), fuel_litres: Number(r.fuel_litres) })) as McRate[];
+    ratesRef.current = parsed;
+    setRates(parsed);
     if (rt.error) showToast('Could not load MCL rates (run the MCL migration): ' + rt.error.message, 'error');
   }, [showToast]);
 
-  // --- the month's records for the selected truck --------------------------------------
+  // --- the month's trips for the selected truck -----------------------------------------
   const loadMonth = useCallback(async () => {
-    if (!vehicleId) { setRows({}); return; }
+    if (!vehicleId) { setLines([]); return; }
     setLoading(true);
     const al = await supabase.from('mcl_truck_fuel_alloc').select('code, fuel_litres').eq('vehicle_id', vehicleId);
     setOverride(Object.fromEntries((al.data || []).map((a: any) => [a.code, Number(a.fuel_litres)])));
-    const { data, error } = await supabase
+
+    const fetchRows = () => supabase
       .from('mcl_trips')
       .select('*')
       .eq('vehicle_id', vehicleId)
       .gte('trip_date', monthStart(month))
-      .lte('trip_date', days[days.length - 1]);
+      .lte('trip_date', days[days.length - 1])
+      .order('trip_date')
+      .order('created_at');
+
+    let { data, error } = await fetchRows();
     if (error) showToast('Failed to load trips: ' + error.message, 'error');
 
-    const next: Record<string, Row> = {};
-    for (const t of data || []) {
-      const date = String(t.trip_date).slice(0, 10);
-      if (next[date]) { next[date].dup += 1; continue; } // keep the first record, flag the rest
-      const weights: Record<number, string> = {};
-      TRIP_NUMS.forEach(n => { const w = Number(t[`trip_${n}`]) || 0; if (w > 0) weights[n] = String(w); });
-      next[date] = {
-        id: t.id,
-        driver_id: t.driver_id || '',
-        weights,
-        sources: parseSources(t.notes),
-        notes: freeNotes(t.notes),
-        legs: legsFromRow(t.trip_legs),
-        dup: 1,
-        dirty: false,
-      };
+    // old records that hold several trips are split into one record per trip (same driver on each)
+    try {
+      if (await splitLegacyRows(data || [], ratesRef.current)) ({ data, error } = await fetchRows());
+    } catch (e: any) {
+      showToast('Could not split an older multi-trip record: ' + (e?.message || e), 'error');
     }
-    setRows(next);
+
+    const next: Line[] = [];
+    for (const rec of data || []) {
+      for (const t of rowTrips(rec)) {
+        next.push({
+          key: newKey(), id: rec.id, date: t.trip_date, driver_id: t.driver_id || '', kg: String(t.kg),
+          src: t.source, from: t.from, to: t.to, notes: t.notes, dirty: false, removed: false,
+        });
+      }
+    }
+    setLines(next);
     setLoading(false);
   }, [vehicleId, month, days, showToast]);
 
-  useEffect(() => { loadLookups().then(() => setLoading(false)); }, [loadLookups]);
-  useEffect(() => { loadMonth(); }, [loadMonth]);
+  useEffect(() => { loadLookups().then(() => { setReady(true); setLoading(false); }); }, [loadLookups]);
+  // wait for the lookups so splitting old records can use the rates; changing rates later does not reload (keeps unsaved edits)
+  useEffect(() => { if (ready) loadMonth(); }, [ready, loadMonth]);
 
   const guard = (go: () => void) => {
-    if (dirtyCount > 0 && !window.confirm(`You have ${dirtyCount} unsaved day(s). Discard them?`)) return;
+    if (dirtyCount > 0 && !window.confirm(`You have ${dirtyCount} unsaved trip(s). Discard them?`)) return;
     go();
   };
 
   // --- editing -------------------------------------------------------------------------
-  const patch = (date: string, fn: (r: Row) => Row) =>
-    setRows(prev => ({ ...prev, [date]: { ...fn(prev[date] ?? emptyRow()), dirty: true } }));
+  const patch = (key: string, p: Partial<Line>) =>
+    setLines(prev => prev.map(l => (l.key === key ? { ...l, ...p, dirty: true } : l)));
 
-  const setWeight = (date: string, n: number, v: string) =>
-    patch(date, r => ({
-      ...r,
-      weights: { ...r.weights, [n]: v },
-      // a new trip with no source picked yet takes the previous trip's source (or M)
-      sources: r.sources[n] ? r.sources : { ...r.sources, [n]: (n > 1 && r.sources[n - 1]) || 'M' },
-    }));
-
-  const setSource = (date: string, n: number, v: string) =>
-    patch(date, r => ({ ...r, sources: { ...r.sources, [n]: v } }));
-
-  const setLeg = (date: string, n: number, p: Partial<{ from: string; to: string }>) =>
-    patch(date, r => ({
-      ...r,
-      legs: { ...r.legs, [n]: { from: r.legs[n]?.from ?? '', to: r.legs[n]?.to ?? '', ...p } },
-    }));
-
-  // copy one From / To onto every trip of the day that has a weight
-  const applyToAll = (date: string) =>
-    patch(date, r => {
-      const legs = { ...r.legs };
-      TRIP_NUMS.filter(n => num(r.weights[n]) > 0).forEach(n => {
-        legs[n] = { from: defFrom || legs[n]?.from || '', to: defTo || legs[n]?.to || '' };
-      });
-      return { ...r, legs };
-    });
-
-  const cleanLegs = (r: Row) => {
-    const out: Record<string, { from: string; to: string }> = {};
-    TRIP_NUMS.forEach(n => {
-      const l = r.legs[n];
-      if (num(r.weights[n]) && l && (l.from.trim() || l.to.trim())) {
-        out[String(n)] = { from: l.from.trim(), to: l.to.trim() };
+  // add an empty trip line to a day (it takes that day's last driver and source)
+  const addLine = (date: string) =>
+    setLines(prev => {
+      const same = prev.filter(l => l.date === date && !l.removed);
+      const last = same[same.length - 1];
+      const fresh = blankLine(date, last?.driver_id ?? driverFilter, last?.src ?? 'M');
+      // insert after the day's last line so the sheet stays in date order
+      const idx = prev.map(l => l.date).lastIndexOf(date);
+      if (idx === -1) {
+        const at = prev.findIndex(l => l.date > date);
+        return at === -1 ? [...prev, fresh] : [...prev.slice(0, at), fresh, ...prev.slice(at)];
       }
+      return [...prev.slice(0, idx + 1), fresh, ...prev.slice(idx + 1)];
     });
-    return out;
+
+  const removeLine = (l: Line) => {
+    if (!l.id) setLines(prev => prev.filter(x => x.key !== l.key)); // never saved: just drop it
+    else patch(l.key, { removed: true });                            // saved: deleted when you press Save
   };
 
   // --- save ----------------------------------------------------------------------------
@@ -177,30 +160,25 @@ export function MclTrips({ portalColor }: { portalColor: string }) {
     if (!vehicleId) return;
     setSaving(true);
     let failed = 0;
-    for (const [date, r] of Object.entries(rows)) {
-      if (!r.dirty) continue;
-      const d = rowToDay(r);
-      const t = dayTotals(d, date, rates);
-      if (!r.id && t.trips === 0) continue; // nothing entered for a new day
 
-      const payload: any = {
-        vehicle_id: vehicleId,
-        driver_id: r.driver_id || null,
-        trip_date: date,
-        status: 'completed',
-        net_tallage: Number(t.tons.toFixed(3)),
-        notes: buildNotes(d.weights, r.sources, r.notes),
-        departure_point: fromOf(r, date) || null,
-        destination: toOf(r, date) || null,
-        trip_legs: cleanLegs(r),
-      };
-      TRIP_NUMS.forEach(n => { payload[`trip_${n}`] = d.weights[n] || 0; });
+    const toDelete = lines.filter(l => l.id && (l.removed || (l.dirty && num(l.kg) <= 0)));
+    const toUpdate = lines.filter(l => l.id && l.dirty && !l.removed && num(l.kg) > 0);
+    const toInsert = lines.filter(l => !l.id && l.dirty && !l.removed && num(l.kg) > 0);
 
-      const { error } = r.id
-        ? await supabase.from('mcl_trips').update(payload).eq('id', r.id)
-        : await supabase.from('mcl_trips').insert([payload]);
-      if (error) { failed++; showToast(`${date}: ${error.message}`, 'error'); }
+    if (toInsert.length) {
+      const { error } = await supabase.from('mcl_trips').insert(toInsert.map(l => tripPayload(toTrip(l, vehicleId), rates)));
+      if (error) { failed++; showToast('New trips: ' + error.message, 'error'); }
     }
+    for (let i = 0; i < toUpdate.length; i += 10) {
+      const res = await Promise.all(toUpdate.slice(i, i + 10).map(l =>
+        supabase.from('mcl_trips').update(tripPayload(toTrip(l, vehicleId), rates)).eq('id', l.id!)));
+      res.forEach((r, j) => { if (r.error) { failed++; showToast(`${toUpdate[i + j].date}: ${r.error.message}`, 'error'); } });
+    }
+    if (toDelete.length) {
+      const { error } = await supabase.from('mcl_trips').delete().in('id', toDelete.map(l => l.id!));
+      if (error) { failed++; showToast('Delete: ' + error.message, 'error'); }
+    }
+
     // keep the fuel cost records (planned litres per day) in step with these trips
     try { await syncFuelMirror(vehicleId, month); } catch { /* fuel tables not set up yet: ignore */ }
     setSaving(false);
@@ -208,12 +186,11 @@ export function MclTrips({ portalColor }: { portalColor: string }) {
     loadMonth();
   };
 
-  // --- "Add Trip Record" form: adds trips to the truck's record for that date (or creates it) ----
+  // --- "Add Trips" form ------------------------------------------------------------------
   const openAdd = () => {
     setAddDate(new Date().toISOString().slice(0, 10));
     setAddVehicle(vehicleId);
-    setAddDriver('');
-    setAddTrips([blankTrip()]);
+    setAddTrips([blankTrip(driverFilter)]);
     setAddOpen(true);
   };
 
@@ -226,57 +203,18 @@ export function MclTrips({ portalColor }: { portalColor: string }) {
     if (entries.length === 0) { showToast('Enter the weight (KG) of at least one trip', 'error'); return; }
     setAddSaving(true);
     try {
-      const found = await supabase.from('mcl_trips').select('*').eq('vehicle_id', addVehicle).eq('trip_date', addDate).limit(1);
-      if (found.error) throw found.error;
-      const ex: any = found.data?.[0];
-
-      const weights: Record<number, number> = {};
-      const sources: Record<number, string> = {};
-      const legs: Record<number, { from: string; to: string }> = {};
-      let free = '';
-      if (ex) {
-        const old = parseSources(ex.notes);
-        TRIP_NUMS.forEach(n => { const w = Number(ex[`trip_${n}`]) || 0; if (w > 0) { weights[n] = w; sources[n] = old[n] || 'M'; } });
-        Object.entries(legsFromRow(ex.trip_legs)).forEach(([k, v]) => { legs[Number(k)] = v; });
-        free = freeNotes(ex.notes);
-      }
-      for (const e of entries) {
-        const slot = TRIP_NUMS.find(n => !weights[n]);
-        if (!slot) throw new Error(`This truck already has ${TRIP_NUMS.length} trips on ${addDate}`);
-        weights[slot] = e.w;
-        sources[slot] = e.src || 'M';
-        if (e.from.trim() || e.to.trim()) legs[slot] = { from: e.from.trim(), to: e.to.trim() };
-      }
-
-      const asRow: Row = {
-        ...emptyRow(),
-        weights: Object.fromEntries(Object.entries(weights).map(([k, v]) => [k, String(v)])),
-        sources, legs,
-      };
-      const totals = dayTotals({ weights, sources }, addDate, rates);
-      const payload: any = {
-        vehicle_id: addVehicle,
-        driver_id: addDriver || ex?.driver_id || null,
-        trip_date: addDate,
-        status: 'completed',
-        net_tallage: Number(totals.tons.toFixed(3)),
-        notes: buildNotes(weights, sources, free),
-        departure_point: fromOf(asRow, addDate) || null,
-        destination: toOf(asRow, addDate) || null,
-        trip_legs: cleanLegs(asRow),
-      };
-      TRIP_NUMS.forEach(n => { payload[`trip_${n}`] = weights[n] || 0; });
-
-      const { error } = ex
-        ? await supabase.from('mcl_trips').update(payload).eq('id', ex.id)
-        : await supabase.from('mcl_trips').insert([payload]);
+      const payloads = entries.map(e => tripPayload({
+        vehicle_id: addVehicle, driver_id: e.driver || null, trip_date: addDate,
+        kg: e.w, source: e.src || 'M', from: e.from, to: e.to, notes: '',
+      }, rates));
+      const { error } = await supabase.from('mcl_trips').insert(payloads);
       if (error) throw error;
 
       try { await syncFuelMirror(addVehicle, addDate.slice(0, 7)); } catch { /* fuel tables not set up yet: ignore */ }
       showToast(`${entries.length} trip${entries.length > 1 ? 's' : ''} saved`, 'success');
       setAddOpen(false);
 
-      // show what was just saved (unless there are unsaved edits in the grid)
+      // show what was just saved (unless there are unsaved edits in the sheet)
       if (dirtyCount === 0) { setVehicleId(addVehicle); setMonth(addDate.slice(0, 7)); }
       loadMonth();
     } catch (e: any) {
@@ -286,60 +224,64 @@ export function MclTrips({ portalColor }: { portalColor: string }) {
     }
   };
 
-  // --- month totals --------------------------------------------------------------------
+  // --- totals ----------------------------------------------------------------------------
+  const calc = useCallback((l: Line) =>
+    dayTotals({ weights: { 1: num(l.kg) }, sources: { 1: l.src || 'M' } }, l.date, rates, override), [rates, override]);
+
+  const visible = useMemo(
+    () => lines.filter(l => !l.removed && (!driverFilter || l.driver_id === driverFilter)),
+    [lines, driverFilter],
+  );
+
   const summary = useMemo(() => {
     let trips = 0, tons = 0, revenue = 0, litres = 0;
     const bySource: Record<string, number> = {};
-    for (const date of days) {
-      const r = rows[date];
-      if (!r) continue;
-      const t = dayTotals(rowToDay(r), date, rates, override);
+    const byDriver: Record<string, { trips: number; tons: number; revenue: number }> = {};
+    for (const l of visible) {
+      if (num(l.kg) <= 0) continue;
+      const t = calc(l);
       trips += t.trips; tons += t.tons; revenue += t.revenue; litres += t.plannedLitres;
       for (const [k, v] of Object.entries(t.bySource)) bySource[k] = (bySource[k] || 0) + v;
+      const dk = l.driver_id || '';
+      const d = byDriver[dk] || (byDriver[dk] = { trips: 0, tons: 0, revenue: 0 });
+      d.trips += t.trips; d.tons += t.tons; d.revenue += t.revenue;
     }
-    return { trips, tons, revenue, litres, bySource };
-  }, [rows, rates, days, override]);
+    return { trips, tons, revenue, litres, bySource, byDriver };
+  }, [visible, calc]);
 
   const truck = vehicles.find(v => v.id === vehicleId)?.plate_number;
+  const driverName = (id: string) => drivers.find(d => d.id === id)?.name || 'No driver';
 
-  // Each trip's From/To = what you typed for that trip, otherwise the route of its material source
-  // (e.g. M -> MCL MINES to CRUSHER).
-  const legFrom = (r: Row, date: string, n: number) =>
-    r.legs[n]?.from || rateFor(rates, r.sources[n] || 'M', date)?.name || '';
-  const legTo = (r: Row, date: string, n: number) =>
-    r.legs[n]?.to || rateFor(rates, r.sources[n] || 'M', date)?.destination || '';
-
-  const usedTrips = (r: Row) => TRIP_NUMS.filter(n => num(r.weights[n]) > 0);
-  const joinUnique = (xs: string[]) => Array.from(new Set(xs.filter(Boolean))).join(' / ');
-  const fromOf = (r: Row, date: string) => joinUnique(usedTrips(r).map(n => legFrom(r, date, n)));
-  const toOf = (r: Row, date: string) => joinUnique(usedTrips(r).map(n => legTo(r, date, n)));
-
-  // "A → B ×4, C → D" for the grid
-  const routeSummary = (r: Row, date: string) => {
-    const counts = new Map<string, number>();
-    usedTrips(r).forEach(n => {
-      const key = `${legFrom(r, date, n) || '?'} → ${legTo(r, date, n) || '?'}`;
-      counts.set(key, (counts.get(key) || 0) + 1);
-    });
-    return Array.from(counts.entries()).map(([k, c]) => (c > 1 ? `${k} ×${c}` : k)).join(', ');
-  };
+  // default route of a trip = the route of its material source (M -> MCL MINES to CRUSHER)
+  const defFrom = (l: Line) => rateFor(rates, l.src || 'M', l.date)?.name || 'From';
+  const defTo = (l: Line) => rateFor(rates, l.src || 'M', l.date)?.destination || 'To';
 
   // places used before, offered as suggestions while typing
   const placeSuggestions = useMemo(() => {
     const set = new Set<string>();
     rates.forEach(r => { if (r.name) set.add(r.name); if (r.destination) set.add(r.destination); });
-    Object.values(rows).forEach(r => Object.values(r.legs).forEach(l => { if (l.from) set.add(l.from); if (l.to) set.add(l.to); }));
+    lines.forEach(l => { if (l.from) set.add(l.from); if (l.to) set.add(l.to); });
     return Array.from(set).sort();
-  }, [rates, rows]);
+  }, [rates, lines]);
 
-  const routeRow = routeDay ? (rows[routeDay] ?? emptyRow()) : null;
+  // sheet rows: every day of the month; a day shows all its trips (or one empty line with an add button)
+  const byDate = useMemo(() => {
+    const m = new Map<string, Line[]>();
+    // removed-but-unsaved lines stay in view (struck through) until Save so they can be restored
+    lines.filter(l => !driverFilter || l.driver_id === driverFilter || !l.id).forEach(l => {
+      const arr = m.get(l.date) || [];
+      arr.push(l);
+      m.set(l.date, arr);
+    });
+    return m;
+  }, [lines, driverFilter]);
 
   return (
     <div className="space-y-5 animate-fade-in">
       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
         <PageHeader
           title="MCL Daily Trip Sheet"
-          subtitle="Enter each truck's trips by day: weight (KG) and material source per trip"
+          subtitle="One line per trip: its own driver, weight (KG) and material source. Add as many trips per day as needed"
           icon={<RouteIcon className="h-6 w-6" />}
           iconColor={portalColor}
         />
@@ -358,9 +300,16 @@ export function MclTrips({ portalColor }: { portalColor: string }) {
           <label className="label">Month</label>
           <input type="month" className="input" value={month} onChange={e => e.target.value && guard(() => setMonth(e.target.value))} />
         </div>
+        <div>
+          <label className="label">Driver</label>
+          <select className="input w-full lg:w-48" value={driverFilter} onChange={e => setDriverFilter(e.target.value)}>
+            <option value="">All drivers</option>
+            {drivers.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+          </select>
+        </div>
         <div className="flex-1" />
         <button onClick={openAdd} className="btn-primary flex items-center gap-2" style={{ background: portalColor }}>
-          <Plus className="h-4 w-4" /> Add Trip
+          <Plus className="h-4 w-4" /> Add Trips
         </button>
         <button onClick={() => downloadMclTemplate('trips', { vehicles, drivers, rates })} className="btn-secondary flex items-center gap-2">
           <Download className="h-4 w-4" /> Download Template
@@ -377,7 +326,7 @@ export function MclTrips({ portalColor }: { portalColor: string }) {
           className="btn-primary flex items-center gap-2 disabled:opacity-50"
           style={{ background: portalColor }}
         >
-          <Save className="h-4 w-4" /> {saving ? 'Saving…' : dirtyCount ? `Save ${dirtyCount} day${dirtyCount > 1 ? 's' : ''}` : 'Saved'}
+          <Save className="h-4 w-4" /> {saving ? 'Saving…' : dirtyCount ? `Save ${dirtyCount} trip${dirtyCount > 1 ? 's' : ''}` : 'Saved'}
         </button>
       </div>
 
@@ -387,6 +336,10 @@ export function MclTrips({ portalColor }: { portalColor: string }) {
         <LoadingSpinner message="Loading trip sheet..." />
       ) : (
         <>
+          <datalist id="mcl-places">
+            {placeSuggestions.map(p => <option key={p} value={p} />)}
+          </datalist>
+
           <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
             <Stat label="Trips" value={fmt(summary.trips)} />
             <Stat label="Tons" value={fmt(summary.tons, 2)} />
@@ -400,61 +353,90 @@ export function MclTrips({ portalColor }: { portalColor: string }) {
             </div>
           </div>
 
+          {Object.keys(summary.byDriver).length > 0 && (
+            <div className="card p-4">
+              <p className="text-xs font-semibold uppercase tracking-wider text-slate-500 mb-2">Trips by driver</p>
+              <div className="flex flex-wrap gap-2">
+                {Object.entries(summary.byDriver)
+                  .sort((a, b) => b[1].trips - a[1].trips)
+                  .map(([id, d]) => (
+                    <button
+                      key={id || 'none'} type="button"
+                      onClick={() => setDriverFilter(driverFilter === id ? '' : id)}
+                      className={`rounded-lg border px-3 py-1.5 text-xs text-left ${driverFilter === id && id ? 'border-blue-400 bg-blue-50' : 'border-slate-200 bg-white hover:bg-slate-50'}`}
+                    >
+                      <span className="font-semibold text-slate-800">{driverName(id)}</span>
+                      <span className="text-slate-500"> · {d.trips} trip{d.trips === 1 ? '' : 's'} · {fmt(d.tons, 2)} t · KSh {fmt(d.revenue)}</span>
+                    </button>
+                  ))}
+              </div>
+            </div>
+          )}
+
           <div className="card overflow-x-auto">
             <table className="data-table text-xs">
               <thead>
                 <tr>
                   <th className="sticky left-0 bg-white z-10">Date</th>
                   <th>Driver</th>
-                  <th>Routes (From → To)</th>
-                  {TRIP_NUMS.map(n => <th key={n} className="text-center">Trip {n}<div className="font-normal text-[9px] text-slate-400">KG · source</div></th>)}
-                  <th className="text-right">Trips</th>
+                  <th className="text-right">KG</th>
+                  <th>Source</th>
+                  <th>From</th>
+                  <th>To</th>
                   <th className="text-right">Tons</th>
                   <th className="text-right">Revenue (KSh)</th>
                   <th className="text-right">Fuel plan (L)</th>
+                  <th />
                 </tr>
               </thead>
               <tbody>
                 {days.map(date => {
-                  const r = rows[date] ?? emptyRow();
-                  const t = dayTotals(rowToDay(r), date, rates, override);
-                  return (
-                    <tr key={date} className={r.dirty ? 'bg-amber-50' : ''}>
-                      <td className="sticky left-0 bg-inherit font-medium text-slate-700 whitespace-nowrap">
-                        {shortDay(date)}
-                        {r.dup > 1 && <span title={`${r.dup} records exist for this day; only the first is shown`} className="ml-1 text-[9px] text-red-600 font-bold">×{r.dup}</span>}
-                      </td>
-                      <td>
-                        <select className="text-[11px] border border-slate-300 rounded px-1 py-1 w-28 bg-white" value={r.driver_id} onChange={e => patch(date, x => ({ ...x, driver_id: e.target.value }))}>
-                          <option value="">—</option>
-                          {drivers.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
-                        </select>
-                      </td>
-                      <td>
-                        {t.trips ? (
-                          <button
-                            type="button"
-                            onClick={() => setRouteDay(date)}
-                            title={routeSummary(r, date)}
-                            className="block w-60 truncate text-left border border-slate-300 rounded px-2 py-1 text-[11px] bg-white hover:bg-blue-50"
-                          >
-                            {routeSummary(r, date) || 'Set routes'}
+                  const dayLines = byDate.get(date) || [];
+                  const live = dayLines.filter(l => !l.removed);
+                  if (dayLines.length === 0) {
+                    return (
+                      <tr key={date}>
+                        <td className="sticky left-0 bg-white font-medium text-slate-400 whitespace-nowrap">{shortDay(date)}</td>
+                        <td colSpan={8} className="text-slate-300">—</td>
+                        <td className="text-right">
+                          <button type="button" onClick={() => addLine(date)} title="Add a trip on this day" className="text-blue-600 hover:text-blue-800 px-1">
+                            <Plus className="h-4 w-4" />
                           </button>
-                        ) : <span className="text-slate-300">—</span>}
-                      </td>
-                      {TRIP_NUMS.map(n => (
-                        <td key={n} className="px-1">
-                          <input
-                            type="number" inputMode="numeric" min={0}
-                            className="w-[4.5rem] border border-slate-300 rounded px-1 py-1 text-[11px] text-right"
-                            value={r.weights[n] ?? ''}
-                            onChange={e => setWeight(date, n, e.target.value)}
-                          />
+                        </td>
+                      </tr>
+                    );
+                  }
+                  return dayLines.map((l, i) => {
+                    const t = calc(l);
+                    const isLastLive = live.length > 0 && l.key === live[live.length - 1].key;
+                    return (
+                      <tr key={l.key} className={l.removed ? 'bg-red-50 opacity-60' : l.dirty ? 'bg-amber-50' : ''}>
+                        <td className="sticky left-0 bg-inherit font-medium text-slate-700 whitespace-nowrap">
+                          {i === 0 ? shortDay(date) : <span className="text-slate-300 pl-3">↳</span>}
+                          {i === 0 && live.length > 1 && <span className="ml-1 text-[9px] text-blue-600 font-bold">{live.length} trips</span>}
+                        </td>
+                        <td>
                           <select
-                            className="block w-[4.5rem] mt-0.5 border border-slate-200 rounded px-0.5 text-[10px] bg-white disabled:opacity-30"
-                            disabled={!num(r.weights[n])}
-                            value={r.sources[n] || 'M'}
-                            onChange={e => setSource(date, n, e.target.value)}
+                            className="text-[11px] border border-slate-300 rounded px-1 py-1 w-32 bg-white"
+                            value={l.driver_id} disabled={l.removed}
+                            onChange={e => patch(l.key, { driver_id: e.target.value })}
+                          >
+                            <option value="">— driver —</option>
+                            {drivers.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+                          </select>
+                        </td>
+                        <td className="px-1">
+                          <input
+                            type="number" inputMode="numeric" min={0} disabled={l.removed}
+                            className="w-24 border border-slate-300 rounded px-1 py-1 text-[11px] text-right"
+                            value={l.kg} onChange={e => patch(l.key, { kg: e.target.value })}
+                          />
+                        </td>
+                        <td className="px-1">
+                          <select
+                            className="w-14 border border-slate-300 rounded px-0.5 py-1 text-[11px] bg-white"
+                            value={l.src || 'M'} disabled={l.removed}
+                            onChange={e => patch(l.key, { src: e.target.value })}
                           >
                             {SOURCE_CODES.map(c => {
                               const rt = rateFor(rates, c, date);
@@ -462,40 +444,67 @@ export function MclTrips({ portalColor }: { portalColor: string }) {
                             })}
                           </select>
                         </td>
-                      ))}
-                      <td className="text-right font-semibold text-blue-700">{t.trips || ''}</td>
-                      <td className="text-right font-semibold text-emerald-700">{t.trips ? fmt(t.tons, 2) : ''}</td>
-                      <td className="text-right">{t.trips ? fmt(t.revenue) : ''}</td>
-                      <td className="text-right text-slate-600">{t.trips ? fmt(t.plannedLitres, 1) : ''}</td>
-                    </tr>
-                  );
+                        <td className="px-1">
+                          <input list="mcl-places" disabled={l.removed} className="w-36 border border-slate-300 rounded px-1 py-1 text-[11px]"
+                            placeholder={defFrom(l)} value={l.from} onChange={e => patch(l.key, { from: e.target.value })} />
+                        </td>
+                        <td className="px-1">
+                          <input list="mcl-places" disabled={l.removed} className="w-36 border border-slate-300 rounded px-1 py-1 text-[11px]"
+                            placeholder={defTo(l)} value={l.to} onChange={e => patch(l.key, { to: e.target.value })} />
+                        </td>
+                        <td className="text-right font-semibold text-emerald-700">{num(l.kg) ? fmt(t.tons, 2) : ''}</td>
+                        <td className="text-right">{num(l.kg) ? fmt(t.revenue) : ''}</td>
+                        <td className="text-right text-slate-600">{num(l.kg) ? fmt(t.plannedLitres, 1) : ''}</td>
+                        <td className="whitespace-nowrap text-right">
+                          {l.removed ? (
+                            <button type="button" title="Undo delete" className="text-slate-500 hover:text-slate-800 px-1"
+                              onClick={() => setLines(prev => prev.map(x => (x.key === l.key ? { ...x, removed: false } : x)))}>
+                              <Undo2 className="h-4 w-4" />
+                            </button>
+                          ) : (
+                            <>
+                              {isLastLive && (
+                                <button type="button" onClick={() => addLine(date)} title="Add another trip on this day" className="text-blue-600 hover:text-blue-800 px-1">
+                                  <Plus className="h-4 w-4" />
+                                </button>
+                              )}
+                              <button type="button" onClick={() => removeLine(l)} title="Delete this trip" className="text-red-500 hover:text-red-700 px-1">
+                                <Trash2 className="h-4 w-4" />
+                              </button>
+                            </>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  });
                 })}
               </tbody>
               <tfoot>
                 <tr className="font-bold bg-slate-50">
-                  <td className="sticky left-0 bg-slate-50">{truck} total</td>
-                  <td colSpan={TRIP_NUMS.length + 2} />
-                  <td className="text-right text-blue-700">{summary.trips}</td>
+                  <td className="sticky left-0 bg-slate-50">{truck} total{driverFilter ? ` · ${driverName(driverFilter)}` : ''}</td>
+                  <td colSpan={5} className="text-blue-700">{summary.trips} trip{summary.trips === 1 ? '' : 's'}</td>
                   <td className="text-right text-emerald-700">{fmt(summary.tons, 2)}</td>
                   <td className="text-right">{fmt(summary.revenue)}</td>
                   <td className="text-right">{fmt(summary.litres, 1)}</td>
+                  <td />
                 </tr>
               </tfoot>
             </table>
           </div>
           <p className="text-[11px] text-slate-500 px-1">
+            Each line is one trip with its own driver. Use <b>+</b> to add another trip to a day (there is no limit) and the bin to delete one.
             Revenue = weight (tons) × the source's shipping rate for that date. Fuel plan = the source's litres per trip.
-            Change rates under “Rates &amp; fuel allocation”.
+            Grey text in From / To is the usual route for the material source; type to use a different place. Press Save to keep your changes.
           </p>
         </>
       )}
 
-      <Modal open={addOpen} onClose={() => setAddOpen(false)} title="Add Trip Record" size="xl">
+      <Modal open={addOpen} onClose={() => setAddOpen(false)} title="Add Trips" size="xl">
         <datalist id="mcl-add-places">
           {placeSuggestions.map(pl => <option key={pl} value={pl} />)}
         </datalist>
         <div className="space-y-5 max-h-[70vh] overflow-y-auto p-1">
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div>
               <label className="label">Date *</label>
               <input type="date" className="input" value={addDate} onChange={e => setAddDate(e.target.value)} />
@@ -507,17 +516,10 @@ export function MclTrips({ portalColor }: { portalColor: string }) {
                 {vehicles.map(v => <option key={v.id} value={v.id}>{v.plate_number}</option>)}
               </select>
             </div>
-            <div>
-              <label className="label">Driver Name</label>
-              <select className="input" value={addDriver} onChange={e => setAddDriver(e.target.value)}>
-                <option value="">Select Driver</option>
-                {drivers.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
-              </select>
-            </div>
           </div>
 
           <div>
-            <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-500 mb-2">Trips</h4>
+            <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-500 mb-2">Trips (each with its own driver)</h4>
             <div className="space-y-3">
               {addTrips.map((t, i) => {
                 const rt = rateFor(rates, t.src || 'M', addDate);
@@ -532,7 +534,14 @@ export function MclTrips({ portalColor }: { portalColor: string }) {
                         </button>
                       )}
                     </div>
-                    <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                    <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
+                      <div>
+                        <label className="label">Driver</label>
+                        <select className="input" value={t.driver} onChange={e => patchNew(i, { driver: e.target.value })}>
+                          <option value="">Select Driver</option>
+                          {drivers.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}
+                        </select>
+                      </div>
                       <div>
                         <label className="label">Weight (KG) *</label>
                         <input type="number" min={0} inputMode="numeric" className="input" placeholder="e.g. 31200"
@@ -564,7 +573,7 @@ export function MclTrips({ portalColor }: { portalColor: string }) {
             </div>
             <div className="flex flex-wrap items-center justify-between mt-3 gap-2">
               <button type="button" className="btn-secondary flex items-center gap-2 text-xs"
-                onClick={() => setAddTrips(list => [...list, { ...blankTrip(), src: list[list.length - 1]?.src || 'M' }])}>
+                onClick={() => setAddTrips(list => [...list, blankTrip(list[list.length - 1]?.driver || '', list[list.length - 1]?.src || 'M')])}>
                 <Plus className="h-4 w-4" /> Add another trip
               </button>
               <span className="text-xs font-semibold text-slate-700">
@@ -575,8 +584,8 @@ export function MclTrips({ portalColor }: { portalColor: string }) {
               </span>
             </div>
             <p className="text-[11px] text-slate-500 mt-2">
-              Grey text in From / To is the usual route for the chosen material source; type to use a different place.
-              If this truck already has trips on this date, the new ones are added after them.
+              Every trip is saved as its own record with the driver you pick on it. A new trip starts with the driver and source of the one above it.
+              Trips are added after any the truck already has on this date.
             </p>
           </div>
         </div>
@@ -584,77 +593,9 @@ export function MclTrips({ portalColor }: { portalColor: string }) {
         <div className="mt-5 flex justify-end gap-2 border-t pt-3">
           <button onClick={() => setAddOpen(false)} className="btn-secondary">Cancel</button>
           <button onClick={saveNewTrips} disabled={addSaving} className="btn-primary" style={{ background: portalColor }}>
-            {addSaving ? 'Saving...' : 'Save Record'}
+            {addSaving ? 'Saving...' : 'Save Trips'}
           </button>
         </div>
-      </Modal>
-
-      <Modal
-        open={!!routeDay}
-        onClose={() => setRouteDay(null)}
-        title={routeDay ? `Routes · ${truck} · ${shortDay(routeDay)}` : 'Routes'}
-        size="xl"
-      >
-        {routeDay && routeRow && (
-          <div className="space-y-4">
-            <datalist id="mcl-places">
-              {placeSuggestions.map(p => <option key={p} value={p} />)}
-            </datalist>
-
-            <p className="text-xs text-slate-500">
-              Each trip can have its own From and To. Grey text is the default for that trip's material source;
-              type to override. Remember to press Save on the main page afterwards.
-            </p>
-
-            <div className="flex flex-wrap items-end gap-2 bg-blue-50 border border-blue-100 rounded-xl p-3">
-              <div className="flex-1 min-w-[140px]">
-                <label className="text-[11px] font-bold text-slate-700">From</label>
-                <input list="mcl-places" className="input text-xs py-1" value={defFrom} onChange={e => setDefFrom(e.target.value)} />
-              </div>
-              <div className="flex-1 min-w-[140px]">
-                <label className="text-[11px] font-bold text-slate-700">To</label>
-                <input list="mcl-places" className="input text-xs py-1" value={defTo} onChange={e => setDefTo(e.target.value)} />
-              </div>
-              <button type="button" className="btn-secondary text-xs" onClick={() => applyToAll(routeDay)}>
-                Apply to all trips
-              </button>
-            </div>
-
-            <div className="space-y-1.5 max-h-[50vh] overflow-y-auto">
-              <div className="grid grid-cols-[44px_70px_50px_1fr_1fr] gap-2 text-[10px] font-semibold uppercase text-slate-500 px-1">
-                <span>Trip</span><span>KG</span><span>Src</span><span>From</span><span>To</span>
-              </div>
-              {usedTrips(routeRow).map(n => (
-                <div key={n} className="grid grid-cols-[44px_70px_50px_1fr_1fr] gap-2 items-center">
-                  <span className="text-[11px] font-bold text-slate-700 px-1">#{n}</span>
-                  <span className="text-[11px] text-slate-600">{routeRow.weights[n]}</span>
-                  <span className="text-[11px] text-slate-600">{routeRow.sources[n] || 'M'}</span>
-                  <input
-                    list="mcl-places"
-                    className="input text-xs py-1"
-                    placeholder={rateFor(rates, routeRow.sources[n] || 'M', routeDay)?.name || 'From'}
-                    value={routeRow.legs[n]?.from || ''}
-                    onChange={e => setLeg(routeDay, n, { from: e.target.value })}
-                  />
-                  <input
-                    list="mcl-places"
-                    className="input text-xs py-1"
-                    placeholder={rateFor(rates, routeRow.sources[n] || 'M', routeDay)?.destination || 'To'}
-                    value={routeRow.legs[n]?.to || ''}
-                    onChange={e => setLeg(routeDay, n, { to: e.target.value })}
-                  />
-                </div>
-              ))}
-              {usedTrips(routeRow).length === 0 && (
-                <p className="text-xs text-slate-400 py-4 text-center">Enter the trip weights first.</p>
-              )}
-            </div>
-
-            <div className="flex justify-end border-t pt-3">
-              <button className="btn-primary" style={{ background: portalColor }} onClick={() => setRouteDay(null)}>Done</button>
-            </div>
-          </div>
-        )}
       </Modal>
 
       <MclImportModal open={importOpen} onClose={() => setImportOpen(false)} kind="trips" lookup={{ vehicles, drivers, rates }} onDone={loadMonth} />
