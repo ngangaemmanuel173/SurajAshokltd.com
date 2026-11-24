@@ -1,4 +1,5 @@
 import { useTruckDriverFilter, TruckDriverBar } from '@/components/TruckDriverFilter';
+import { usePeriodFilter, PeriodBar } from '@/components/PeriodFilter';
 import { useEffect, useState, useCallback, useMemo } from 'react';
 import { Calculator, Plus, Edit, Link2, Upload } from 'lucide-react';
 import { supabase, getSubAccountFilter, activeSubAccount } from '@/lib/supabase';
@@ -36,6 +37,8 @@ export function SubAccountTallies({ mclArea, portalColor }: { mclArea: MCLArea |
   const [tallies, setTallies] = useState<SubTally[]>([]);
   const [vehicles, setVehicles] = useState<any[]>([]);
   const tdf = useTruckDriverFilter();
+  const tallyDates = useMemo(() => tallies.map(t => t.tally_date), [tallies]);
+  const period = usePeriodFilter(tallyDates);
   const [trips, setTrips] = useState<any[]>([]);
   const [modalOpen, setModalOpen] = useState(false);
   const [isBulkOpen, setIsBulkOpen] = useState(false);
@@ -72,8 +75,8 @@ export function SubAccountTallies({ mclArea, portalColor }: { mclArea: MCLArea |
 
   const visibleTallies = useMemo(() => {
     const base = isMCL && mclArea ? tallies.filter(t => t.mcl_area_id === mclArea) : tallies;
-    return base.filter(t => tdf.okRow(t.vehicle_id, null));
-  }, [tallies, isMCL, mclArea, tdf.okRow]);
+    return base.filter(t => tdf.okRow(t.vehicle_id, null) && period.okDate(t.tally_date));
+  }, [tallies, isMCL, mclArea, tdf.okRow, period.okDate]);
 
   const summary = useMemo(() => {
     const now = new Date();
@@ -165,7 +168,10 @@ export function SubAccountTallies({ mclArea, portalColor }: { mclArea: MCLArea |
         </div>
       </div>
 
-      <TruckDriverBar f={tdf} />
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+        <TruckDriverBar f={tdf} />
+        <PeriodBar f={period} />
+      </div>
 
       {loading ? (
         <LoadingSpinner message="Loading tallies..." />
