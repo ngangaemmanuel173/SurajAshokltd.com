@@ -50,16 +50,17 @@ const SKIPPED = 'Removed';
 const norm = (v: any) => String(v ?? '').trim().toLowerCase();
 
 /**
- * Allowance for one trip from the saved rates: the most specific matching rate wins
- * (From + To  >  only From or only To  >  the default per-trip rate). Falls back to a payment saved on the trip.
+ * Allowance for one trip from the saved rates (by product and/or route): the most specific matching rate wins
+ * (Product + route  >  Product or route  >  the default per-trip rate). Falls back to a payment saved on the trip.
  */
 function amountForTrip(t: any, rates: any[]): number {
   let best = -1, amt = 0;
   for (const r of rates) {
-    const f = norm(r.from_place), to = norm(r.to_place);
+    const pr = norm(r.product), f = norm(r.from_place), to = norm(r.to_place);
+    if (pr && pr !== norm(t.product || t.item)) continue;
     if (f && f !== norm(t.departure_point)) continue;
     if (to && to !== norm(t.arrival_point || t.destination)) continue;
-    const score = (f ? 1 : 0) + (to ? 1 : 0);
+    const score = (pr ? 1 : 0) + (f ? 1 : 0) + (to ? 1 : 0);
     if (score > best) { best = score; amt = Number(r.amount) || 0; }
   }
   // Older MCL records can hold several trips in one row (trip_1 … trip_13 weights): every trip earns the allowance.
@@ -154,7 +155,9 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
   const [unpriced, setUnpriced] = useState(0);
   const [ratesOpen, setRatesOpen] = useState(false);
   const [defaultDraft, setDefaultDraft] = useState('');
-  const [routeDraft, setRouteDraft] = useState<{ key: string; id?: string; from_place: string; to_place: string; amount: string }[]>([]);
+  const [routeDraft, setRouteDraft] = useState<{ key: string; id?: string; product: string; from_place: string; to_place: string; amount: string }[]>([]);
+  const [productOptions, setProductOptions] = useState<string[]>([]);
+  const byProduct = subAccount !== 'mcl'; // CSL (and the long-distance accounts) pay by product; MCL pays by route
   const [savingRates, setSavingRates] = useState(false);
   const syncing = useRef(false);
 
@@ -318,12 +321,21 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
 
   /* ------------------------------ rates ------------------------------ */
   const openRates = () => {
-    const def = rates.find(r => !norm(r.from_place) && !norm(r.to_place));
+    const def = rates.find(r => !norm(r.product) && !norm(r.from_place) && !norm(r.to_place));
     setDefaultDraft(def ? String(def.amount) : '');
     setRouteDraft(rates.filter(r => r !== def).map(r => ({
-      key: r.id, id: r.id, from_place: r.from_place || '', to_place: r.to_place || '', amount: String(r.amount),
+      key: r.id, id: r.id, product: r.product || '', from_place: r.from_place || '', to_place: r.to_place || '', amount: String(r.amount),
     })));
     setRatesOpen(true);
+    // every product used on this sub-account's trips, so they can be picked from the list
+    const src = TRIP_SOURCE[subAccount];
+    if (byProduct && src) {
+      supabase.from(src.table).select('*').limit(3000).then(({ data }: any) => {
+        const set = new Set<string>();
+        (data || []).forEach((x: any) => { const v = String(x.product || x.item || '').trim(); if (v) set.add(v.toUpperCase()); });
+        setProductOptions(Array.from(set).sort());
+      });
+    }
   };
   const placeSuggestions = useMemo(() => {
     const set = new Set<string>();
@@ -331,12 +343,18 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
     rates.forEach(r => { if (r.from_place) set.add(r.from_place); if (r.to_place) set.add(r.to_place); });
     return Array.from(set).sort();
   }, [trips, rates]);
+  const productSuggestions = useMemo(() => {
+    const set = new Set<string>(productOptions);
+    trips.forEach(t => { const v = String(t.product || t.item || '').trim(); if (v) set.add(v.toUpperCase()); });
+    rates.forEach(r => { if (r.product) set.add(String(r.product).toUpperCase()); });
+    return Array.from(set).sort();
+  }, [productOptions, trips, rates]);
 
   const saveRates = async () => {
-    const def = rates.find(r => !norm(r.from_place) && !norm(r.to_place));
+    const def = rates.find(r => !norm(r.product) && !norm(r.from_place) && !norm(r.to_place));
     const defAmt = Number(defaultDraft) || 0;
     for (const r of routeDraft) {
-      if (!r.from_place.trim() && !r.to_place.trim()) return toast('Each route rate needs a From or a To place', 'error');
+      if (!r.product.trim() && !r.from_place.trim() && !r.to_place.trim()) return toast(byProduct ? 'Each rate needs a product or a From / To place' : 'Each route rate needs a From or a To place', 'error');
       if (!(Number(r.amount) > 0)) return toast('Enter an amount for every route rate', 'error');
     }
     setSavingRates(true);
@@ -347,11 +365,11 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
       // default per-trip rate
       if (defAmt > 0) {
         if (def) { keepIds.add(def.id); ops.push(supabase.from('allowance_rates').update({ amount: defAmt }).eq('id', def.id)); }
-        else ops.push(supabase.from('allowance_rates').insert({ sub_account: subAccount, from_place: null, to_place: null, amount: defAmt }));
+        else ops.push(supabase.from('allowance_rates').insert({ sub_account: subAccount, product: null, from_place: null, to_place: null, amount: defAmt }));
       }
       // route rates
       for (const r of routeDraft) {
-        const row = { from_place: clean(r.from_place), to_place: clean(r.to_place), amount: Number(r.amount) };
+        const row = { product: clean(r.product), from_place: clean(r.from_place), to_place: clean(r.to_place), amount: Number(r.amount) };
         if (r.id) { keepIds.add(r.id); ops.push(supabase.from('allowance_rates').update(row).eq('id', r.id)); }
         else ops.push(supabase.from('allowance_rates').insert({ ...row, sub_account: subAccount }));
       }
@@ -419,12 +437,12 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
         </div>
       ) : rates.length === 0 ? (
         <div className="flex flex-col sm:flex-row sm:items-center gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
-          <span className="flex-1">No allowance rate is set yet. Enter the allowance per trip once and every trip will get its allowance automatically.</span>
+          <span className="flex-1">No allowance rate is set yet. {byProduct ? 'Enter the allowance for each product' : 'Enter the allowance for each route'} once and every trip will get its allowance automatically.</span>
           <button onClick={openRates} className="rounded-lg px-4 py-2 text-sm font-semibold text-white" style={{ background: portalColor }}>Set allowance rates</button>
         </div>
       ) : unpriced > 0 ? (
         <div className="flex flex-col sm:flex-row sm:items-center gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
-          <span className="flex-1">{unpriced} trip{unpriced === 1 ? '' : 's'} this week {unpriced === 1 ? 'has' : 'have'} no matching allowance rate. Add a default per-trip rate or a rate for that route.</span>
+          <span className="flex-1">{unpriced} trip{unpriced === 1 ? '' : 's'} this week {unpriced === 1 ? 'has' : 'have'} no matching allowance rate. {byProduct ? 'Add a rate for that product, or a default amount.' : 'Add a rate for that route.'}</span>
           <button onClick={openRates} className="rounded-lg px-4 py-2 text-sm font-semibold text-white" style={{ background: portalColor }}>Edit rates</button>
         </div>
       ) : null}
@@ -563,33 +581,36 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
       {ratesOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
           <div className="absolute inset-0 bg-black/40" onClick={() => setRatesOpen(false)} />
-          <div className="relative z-10 w-full max-w-xl rounded-2xl bg-white p-5 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
+          <div className={`relative z-10 w-full ${byProduct ? 'max-w-3xl' : 'max-w-xl'} rounded-2xl bg-white p-5 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto`}>
             <div className="flex items-center justify-between"><h3 className="text-base font-bold text-slate-800">Allowance rates</h3><button onClick={() => setRatesOpen(false)}><X className="h-5 w-5 text-slate-400" /></button></div>
-            <p className="text-xs text-slate-500">Set it once. Every trip with a driver gets this allowance automatically. Change a rate any time: new trips use it straight away, and you can choose to recalculate the week on screen.</p>
+            <p className="text-xs text-slate-500">Set it once. Every trip with a driver gets its allowance automatically. Change a rate any time: new trips use it straight away, and you can choose to recalculate the week on screen.</p>
             <div>
-              <label className={labelCls}>Allowance per trip (KES) *</label>
+              <label className={labelCls}>{byProduct ? 'Allowance per trip for any other product (KES)' : 'Allowance per trip (KES) *'}</label>
               <input type="number" min="0" value={defaultDraft} onChange={e => setDefaultDraft(e.target.value)} placeholder="e.g. 1500" className={inputCls} />
             </div>
             <div className="space-y-2">
               <div className="flex items-center justify-between">
-                <label className={labelCls + ' mb-0'}>Different amount for a route (optional)</label>
-                <button onClick={() => setRouteDraft(d => [...d, { key: String(Date.now() + Math.random()), from_place: '', to_place: '', amount: '' }])}
-                  className="text-xs font-semibold text-blue-600 hover:underline">+ Add route</button>
+                <label className={labelCls + ' mb-0'}>{byProduct ? 'Allowance per product (and route, if needed)' : 'Allowance per route'}</label>
+                <button onClick={() => setRouteDraft(d => [...d, { key: String(Date.now() + Math.random()), product: '', from_place: '', to_place: '', amount: '' }])}
+                  className="text-xs font-semibold text-blue-600 hover:underline">{byProduct ? '+ Add product' : '+ Add route'}</button>
               </div>
+              <datalist id="allowance-products">{productSuggestions.map(p => <option key={p} value={p} />)}</datalist>
               <datalist id="allowance-places">{placeSuggestions.map(p => <option key={p} value={p} />)}</datalist>
-              {routeDraft.length === 0 && <p className="text-xs text-slate-400">No route rates. Every trip uses the amount above.</p>}
+              {routeDraft.length === 0 && <p className="text-xs text-slate-400">{byProduct ? 'No product rates yet. Add each product with its allowance.' : 'No route rates yet. Add each route with its allowance.'}</p>}
               {routeDraft.map(r => (
-                <div key={r.key} className="grid grid-cols-[1fr_1fr_6rem_auto] gap-2 items-center">
-                  <input list="allowance-places" value={r.from_place} placeholder="From (any)" className={inputCls}
+                <div key={r.key} className={`grid ${byProduct ? 'grid-cols-[1.2fr_1fr_1fr_6rem_auto]' : 'grid-cols-[1fr_1fr_6rem_auto]'} gap-2 items-center`}>
+                  {byProduct && <input list="allowance-products" value={r.product} placeholder="Product" className={inputCls}
+                    onChange={e => setRouteDraft(d => d.map(x => x.key === r.key ? { ...x, product: e.target.value } : x))} />}
+                  <input list="allowance-places" value={r.from_place} placeholder={byProduct ? "From (optional)" : "From"} className={inputCls}
                     onChange={e => setRouteDraft(d => d.map(x => x.key === r.key ? { ...x, from_place: e.target.value } : x))} />
-                  <input list="allowance-places" value={r.to_place} placeholder="To (any)" className={inputCls}
+                  <input list="allowance-places" value={r.to_place} placeholder={byProduct ? "To (optional)" : "To"} className={inputCls}
                     onChange={e => setRouteDraft(d => d.map(x => x.key === r.key ? { ...x, to_place: e.target.value } : x))} />
                   <input type="number" min="0" value={r.amount} placeholder="KES" className={inputCls}
                     onChange={e => setRouteDraft(d => d.map(x => x.key === r.key ? { ...x, amount: e.target.value } : x))} />
                   <button onClick={() => setRouteDraft(d => d.filter(x => x.key !== r.key))} className="text-slate-400 hover:text-red-600" aria-label="Remove route rate"><Trash2 className="h-4 w-4" /></button>
                 </div>
               ))}
-              <p className="text-[11px] text-slate-400">The most specific rate wins: From + To, then only From or only To, then the amount per trip. Place names must match the trip's From / To (capital letters do not matter).</p>
+              <p className="text-[11px] text-slate-400">{byProduct ? 'Product names must match the trip\'s Product. Add From / To only if the same product pays differently on a route. The most specific rate wins, then the amount above. Capital letters do not matter.' : 'Place names must match the trip\'s From / To (capital letters do not matter). The most specific rate wins.'}</p>
             </div>
             <div className="flex justify-end gap-2 pt-1">
               <button onClick={() => setRatesOpen(false)} className="rounded-lg border border-slate-300 px-4 py-2 text-sm">Cancel</button>
