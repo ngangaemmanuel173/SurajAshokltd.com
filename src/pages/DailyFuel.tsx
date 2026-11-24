@@ -43,7 +43,7 @@ export function DailyFuel({ portalColor }: { portalColor: string }) {
   const [fuelType, setFuelType] = useState<FuelType>('diesel');
   const [date, setDate] = useState(localToday());
   const [month, setMonth] = useState(localToday().slice(0, 7));
-  const [week, setWeek] = useState('all'); // 'all' | Monday of the chosen week (sheet + entries views)
+  const [week, setWeek] = useState('all'); // 'all' | Saturday of the chosen week (sheet + entries views)
   const [search, setSearch] = useState('');
   const [price, setPrice] = useState(DEFAULT_PRICE.diesel);
   const [costs, setCosts] = useState<Record<string, string>>({});
