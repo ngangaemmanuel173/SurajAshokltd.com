@@ -627,6 +627,7 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
         portalColor={portalColor}
         subAccount={subAccount}
         sampleColumns={ALLOWANCE_COLUMNS}
+        sampleRow={[new Date().toISOString().slice(0, 10), '1500', 'DRIVER NAME', 'KDG 123A', 'MICD → CSL', '']}
         transformRecord={rec => {
           const r = resolveNamesToIds(rec, vehicles, drivers);
           // Same checks as the Add Allowance form
