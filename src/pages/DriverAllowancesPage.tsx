@@ -51,18 +51,20 @@ const norm = (v: any) => String(v ?? '').trim().toLowerCase();
 
 /**
  * Allowance for one trip from the saved rates (by product and/or route): the most specific matching rate wins
- * (Product + route  >  Product or route  >  the default per-trip rate). Falls back to a payment saved on the trip.
+ * (Product + route  >  Product only  >  route only  >  the default per-trip rate). Falls back to a payment saved on the trip.
  */
-function amountForTrip(t: any, rates: any[]): number {
-  let best = -1, amt = 0;
+function amountForTrip(t: any, rates: any[], seq = 1): number {
+  let best = -1, amt = 0, third = 0;
   for (const r of rates) {
     const pr = norm(r.product), f = norm(r.from_place), to = norm(r.to_place);
     if (pr && pr !== norm(t.product || t.item)) continue;
     if (f && f !== norm(t.departure_point)) continue;
     if (to && to !== norm(t.arrival_point || t.destination)) continue;
-    const score = (pr ? 1 : 0) + (f ? 1 : 0) + (to ? 1 : 0);
-    if (score > best) { best = score; amt = Number(r.amount) || 0; }
+    const score = (pr ? 4 : 0) + (f ? 1 : 0) + (to ? 1 : 0); // a product rate beats a route-only rate
+    if (score > best) { best = score; amt = Number(r.amount) || 0; third = Number(r.third_trip_amount) || 0; }
   }
+  // The driver's 3rd trip of the day (and any after it) can pay a different amount than the first two.
+  if (seq >= 3 && third > 0) amt = third;
   // Older MCL records can hold several trips in one row (trip_1 … trip_13 weights): every trip earns the allowance.
   let trips = 0;
   for (let n = 1; n <= 13; n++) if (Number(t[`trip_${n}`]) > 0) trips++;
@@ -83,8 +85,20 @@ async function syncAllowances(o: {
   const label = (t: any) => `${t.trip_date} · ${o.plate[t.vehicle_id] || '—'} · ${t.departure_point || '?'} → ${t.arrival_point || t.destination || '?'}`;
   const toCreate: any[] = [], toUpdate: { id: string; amount: number }[] = [];
   let unpriced = 0;
+  // Which trip of the day each one is for its driver (1st, 2nd, 3rd ...), in the order the trips were entered
+  const seqOf = new Map<string, number>();
+  const perDay = new Map<string, any[]>();
   for (const t of eligible) {
-    const amt = amountForTrip(t, o.rates);
+    const k = `${t.driver_id}|${t.trip_date}`;
+    if (!perDay.has(k)) perDay.set(k, []);
+    perDay.get(k)!.push(t);
+  }
+  perDay.forEach(list => {
+    list.sort((x, y) => String(x.created_at || '').localeCompare(String(y.created_at || '')) || String(x.id).localeCompare(String(y.id)));
+    list.forEach((t, i) => seqOf.set(t.id, i + 1));
+  });
+  for (const t of eligible) {
+    const amt = amountForTrip(t, o.rates, seqOf.get(t.id) || 1);
     const e = byTrip.get(t.id);
     if (!e) {
       if (amt > 0) toCreate.push({
@@ -145,6 +159,11 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
   const [onlyPaid, setOnlyPaid] = useState(false);
 
   const [open, setOpen] = useState(false);
+  // Container trip where the driver did not return the empty: part of his allowance goes to the driver who returned it
+  const [emptyFor, setEmptyFor] = useState<any | null>(null);
+  const [emptyBy, setEmptyBy] = useState('');
+  const [emptyAmt, setEmptyAmt] = useState('100');
+  const [emptyBusy, setEmptyBusy] = useState(false);
   const [editId, setEditId] = useState<string | null>(null);
   const [form, setForm] = useState(emptyForm(todayStr()));
   const [saving, setSaving] = useState(false);
@@ -155,7 +174,7 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
   const [unpriced, setUnpriced] = useState(0);
   const [ratesOpen, setRatesOpen] = useState(false);
   const [defaultDraft, setDefaultDraft] = useState('');
-  const [routeDraft, setRouteDraft] = useState<{ key: string; id?: string; product: string; from_place: string; to_place: string; amount: string }[]>([]);
+  const [routeDraft, setRouteDraft] = useState<{ key: string; id?: string; product: string; from_place: string; to_place: string; amount: string; third: string }[]>([]);
   const [productOptions, setProductOptions] = useState<string[]>([]);
   const byProduct = subAccount !== 'mcl'; // CSL (and the long-distance accounts) pay by product; MCL pays by route
   const [savingRates, setSavingRates] = useState(false);
@@ -293,6 +312,43 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
     if (ws !== weekStart) setWeekStart(ws); else load();
   };
 
+  const NOT_RETURNED = 'Empty container not returned';
+  const openEmpty = (r: any) => {
+    const rt = rates.find(x => norm(x.product) === 'returning empty container' && !norm(x.from_place) && !norm(x.to_place));
+    setEmptyFor(r); setEmptyBy(''); setEmptyAmt(String(rt ? Number(rt.amount) : 100));
+  };
+  const confirmEmpty = async () => {
+    if (!emptyFor) return;
+    const ded = Number(emptyAmt);
+    if (!emptyBy) return toast('Choose the driver who returned the empty container', 'error');
+    if (emptyBy === emptyFor.driver_id) return toast('Choose a different driver from the one who did not return it', 'error');
+    if (!(ded > 0)) return toast('Enter the amount to move', 'error');
+    if (ded > Number(emptyFor.amount)) return toast('That is more than this allowance', 'error');
+    setEmptyBusy(true);
+    try {
+      const from = dName[emptyFor.driver_id] || 'the driver', to = dName[emptyBy] || 'the other driver';
+      const u = await supabase.from('driver_allowances').update({
+        amount: Number(emptyFor.amount) - ded,
+        notes: `${NOT_RETURNED}: KES ${ded} deducted and paid to ${to}`,
+      }).eq('id', emptyFor.id);
+      if (u.error) throw u.error;
+      const ins = await supabase.from('driver_allowances').insert({
+        sub_account: subAccount, allowance_date: emptyFor.allowance_date, driver_id: emptyBy, vehicle_id: null, trip_id: null,
+        trip_ref: `Returned empty container for ${from}${emptyFor.trip_ref ? ` (${emptyFor.trip_ref})` : ''}`,
+        amount: ded, notes: `Returned empty container for ${from}`, entered_by: who,
+      });
+      if (ins.error) {
+        // put the first change back so nobody is short-paid without the other being credited
+        await supabase.from('driver_allowances').update({ amount: Number(emptyFor.amount), notes: emptyFor.notes }).eq('id', emptyFor.id);
+        throw ins.error;
+      }
+      toast(`KES ${ded} moved from ${from} to ${to}`);
+      setEmptyFor(null);
+      load();
+    } catch (e: any) { toast(e?.message || 'Could not save the change', 'error'); }
+    finally { setEmptyBusy(false); }
+  };
+
   const remove = async (id: string) => {
     const row = rows.find(r => r.id === id);
     const isAuto = !!row?.trip_id; // linked to a trip: keep a KES 0 marker so the automatic calculation does not add it back
@@ -324,7 +380,7 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
     const def = rates.find(r => !norm(r.product) && !norm(r.from_place) && !norm(r.to_place));
     setDefaultDraft(def ? String(def.amount) : '');
     setRouteDraft(rates.filter(r => r !== def).map(r => ({
-      key: r.id, id: r.id, product: r.product || '', from_place: r.from_place || '', to_place: r.to_place || '', amount: String(r.amount),
+      key: r.id, id: r.id, product: r.product || '', from_place: r.from_place || '', to_place: r.to_place || '', amount: String(r.amount), third: r.third_trip_amount ? String(r.third_trip_amount) : '',
     })));
     setRatesOpen(true);
     // every product used on this sub-account's trips, so they can be picked from the list
@@ -369,7 +425,7 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
       }
       // route rates
       for (const r of routeDraft) {
-        const row = { product: clean(r.product), from_place: clean(r.from_place), to_place: clean(r.to_place), amount: Number(r.amount) };
+        const row = { product: clean(r.product), from_place: clean(r.from_place), to_place: clean(r.to_place), amount: Number(r.amount), third_trip_amount: Number(r.third) > 0 ? Number(r.third) : null };
         if (r.id) { keepIds.add(r.id); ops.push(supabase.from('allowance_rates').update(row).eq('id', r.id)); }
         else ops.push(supabase.from('allowance_rates').insert({ ...row, sub_account: subAccount }));
       }
@@ -541,6 +597,9 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
                     <td className="text-right font-bold text-slate-800">{kesFull(Number(r.amount))}</td>
                     <td className="text-xs text-slate-500">{r.entered_by || '—'}</td>
                     <td className="whitespace-nowrap">
+                      {byProduct && r.trip_id && !String(r.notes || '').startsWith(NOT_RETURNED) && (
+                        <button onClick={() => openEmpty(r)} title="Driver did not return the empty container" className="mr-3 rounded border border-slate-300 px-2 py-0.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50">Empty not returned</button>
+                      )}
                       <button onClick={() => openEdit(r)} className="mr-2 text-slate-400 hover:text-slate-700" aria-label="Edit"><Pencil className="h-4 w-4" /></button>
                       <button onClick={() => remove(r.id)} className="text-slate-400 hover:text-red-600" aria-label="Delete"><Trash2 className="h-4 w-4" /></button>
                     </td>
@@ -549,6 +608,24 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
             </div>
           )}
         </>
+      )}
+
+      {emptyFor && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/40" onClick={() => setEmptyFor(null)} />
+          <div className="relative z-10 w-full max-w-md rounded-2xl bg-white p-5 shadow-2xl space-y-3">
+            <div className="flex items-center justify-between"><h3 className="text-base font-bold text-slate-800">Empty container not returned</h3><button onClick={() => setEmptyFor(null)}><X className="h-5 w-5 text-slate-400" /></button></div>
+            <p className="text-sm text-slate-600"><b>{dName[emptyFor.driver_id] || 'This driver'}</b> took the container but did not return the empty to the depot. The amount below is deducted from his allowance and paid to the driver who returned it.</p>
+            <p className="text-xs text-slate-500">{emptyFor.trip_ref || ''} · allowance {kesFull(Number(emptyFor.amount))}</p>
+            <div><label className={labelCls}>Driver who returned the empty *</label>
+              <select value={emptyBy} onChange={e => setEmptyBy(e.target.value)} className={inputCls}><option value="">—</option>{drivers.filter(d => d.id !== emptyFor.driver_id).map(d => <option key={d.id} value={d.id}>{d.name}</option>)}</select></div>
+            <div><label className={labelCls}>Amount to move (KES)</label><input type="number" min="0" value={emptyAmt} onChange={e => setEmptyAmt(e.target.value)} className={inputCls} /></div>
+            <div className="flex justify-end gap-2 pt-1">
+              <button onClick={() => setEmptyFor(null)} className="rounded-lg border border-slate-300 px-4 py-2 text-sm">Cancel</button>
+              <button onClick={confirmEmpty} disabled={emptyBusy} className="rounded-lg px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" style={{ background: portalColor }}>{emptyBusy ? 'Saving...' : 'Move amount'}</button>
+            </div>
+          </div>
+        </div>
       )}
 
       {open && (
@@ -591,14 +668,14 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
             <div className="space-y-2">
               <div className="flex items-center justify-between">
                 <label className={labelCls + ' mb-0'}>{byProduct ? 'Allowance per product (and route, if needed)' : 'Allowance per route'}</label>
-                <button onClick={() => setRouteDraft(d => [...d, { key: String(Date.now() + Math.random()), product: '', from_place: '', to_place: '', amount: '' }])}
+                <button onClick={() => setRouteDraft(d => [...d, { key: String(Date.now() + Math.random()), product: '', from_place: '', to_place: '', amount: '', third: '' }])}
                   className="text-xs font-semibold text-blue-600 hover:underline">{byProduct ? '+ Add product' : '+ Add route'}</button>
               </div>
               <datalist id="allowance-products">{productSuggestions.map(p => <option key={p} value={p} />)}</datalist>
               <datalist id="allowance-places">{placeSuggestions.map(p => <option key={p} value={p} />)}</datalist>
               {routeDraft.length === 0 && <p className="text-xs text-slate-400">{byProduct ? 'No product rates yet. Add each product with its allowance.' : 'No route rates yet. Add each route with its allowance.'}</p>}
               {routeDraft.map(r => (
-                <div key={r.key} className={`grid ${byProduct ? 'grid-cols-[1.2fr_1fr_1fr_6rem_auto]' : 'grid-cols-[1fr_1fr_6rem_auto]'} gap-2 items-center`}>
+                <div key={r.key} className={`grid ${byProduct ? 'grid-cols-[1.2fr_1fr_1fr_5rem_5rem_auto]' : 'grid-cols-[1fr_1fr_5rem_5rem_auto]'} gap-2 items-center`}>
                   {byProduct && <input list="allowance-products" value={r.product} placeholder="Product" className={inputCls}
                     onChange={e => setRouteDraft(d => d.map(x => x.key === r.key ? { ...x, product: e.target.value } : x))} />}
                   <input list="allowance-places" value={r.from_place} placeholder={byProduct ? "From (optional)" : "From"} className={inputCls}
@@ -607,10 +684,12 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
                     onChange={e => setRouteDraft(d => d.map(x => x.key === r.key ? { ...x, to_place: e.target.value } : x))} />
                   <input type="number" min="0" value={r.amount} placeholder="KES" className={inputCls}
                     onChange={e => setRouteDraft(d => d.map(x => x.key === r.key ? { ...x, amount: e.target.value } : x))} />
+                  <input type="number" min="0" value={r.third} placeholder="3rd trip" title="Allowance for the driver's 3rd trip of the day and after (leave empty to pay the same amount)" className={inputCls}
+                    onChange={e => setRouteDraft(d => d.map(x => x.key === r.key ? { ...x, third: e.target.value } : x))} />
                   <button onClick={() => setRouteDraft(d => d.filter(x => x.key !== r.key))} className="text-slate-400 hover:text-red-600" aria-label="Remove route rate"><Trash2 className="h-4 w-4" /></button>
                 </div>
               ))}
-              <p className="text-[11px] text-slate-400">{byProduct ? 'Product names must match the trip\'s Product. Add From / To only if the same product pays differently on a route. The most specific rate wins, then the amount above. Capital letters do not matter.' : 'Place names must match the trip\'s From / To (capital letters do not matter). The most specific rate wins.'}</p>
+              <p className="text-[11px] text-slate-400">{byProduct ? 'Product names must match the trip\'s Product. Add From / To only if the same product pays differently on a route. The most specific rate wins, then the amount above. The "3rd trip" box is what the driver gets for his 3rd trip of the day and after; leave it empty to pay the same for every trip. Capital letters do not matter.' : 'Place names must match the trip\'s From / To (capital letters do not matter). The most specific rate wins. The "3rd trip" box is what the driver gets for his 3rd trip of the day and after; leave it empty to pay the same for every trip.'}</p>
             </div>
             <div className="flex justify-end gap-2 pt-1">
               <button onClick={() => setRatesOpen(false)} className="rounded-lg border border-slate-300 px-4 py-2 text-sm">Cancel</button>
