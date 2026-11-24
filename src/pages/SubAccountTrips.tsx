@@ -1,4 +1,5 @@
 import { useTruckDriverFilter, TruckDriverBar } from '@/components/TruckDriverFilter';
+import { usePeriodFilter, PeriodBar } from '@/components/PeriodFilter';
 import { useEffect, useState, useCallback, useMemo } from 'react';
 import { Route as RouteIcon, Edit, Upload } from 'lucide-react';
 import { supabase, getSubAccountFilter, activeSubAccount } from '@/lib/supabase';
@@ -115,6 +116,8 @@ export function SubAccountTrips({ mclArea, portalColor }: { mclArea: MCLArea | n
   const [trips, setTrips] = useState<any[]>([]);
   const [vehicles, setVehicles] = useState<any[]>([]);
   const tdf = useTruckDriverFilter();
+  const tripDates = useMemo(() => trips.map(t => t.trip_date || t.date_loaded), [trips]);
+  const period = usePeriodFilter(tripDates);
   const [drivers, setDrivers] = useState<any[]>([]);
   const [modalOpen, setModalOpen] = useState(false);
   const [isBulkOpen, setIsBulkOpen] = useState(false);
@@ -146,8 +149,8 @@ export function SubAccountTrips({ mclArea, portalColor }: { mclArea: MCLArea | n
 
   const visibleTrips = useMemo(() => {
     const base = isMCL && mclArea ? trips.filter(t => t.mcl_area_id === mclArea) : trips;
-    return base.filter(t => tdf.okRow(t.vehicle_id, t.driver_id));
-  }, [trips, isMCL, mclArea, tdf.okRow]);
+    return base.filter(t => tdf.okRow(t.vehicle_id, t.driver_id) && period.okDate(t.trip_date || t.date_loaded));
+  }, [trips, isMCL, mclArea, tdf.okRow, period.okDate]);
 
   const openAdd = () => {
     setForm(emptyForm());
@@ -263,13 +266,16 @@ export function SubAccountTrips({ mclArea, portalColor }: { mclArea: MCLArea | n
         </button>
       </div>
 
-      <TruckDriverBar f={tdf} />
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+        <TruckDriverBar f={tdf} />
+        <PeriodBar f={period} />
+      </div>
 
       {loading ? (
         <LoadingSpinner message="Loading trip logs..." />
       ) : visibleTrips.length === 0 ? (
         <div className="card">
-          <EmptyState icon={<RouteIcon className="h-8 w-8" />} title="No trip records found" message="Import your spreadsheet or add a new record." />
+          <EmptyState icon={<RouteIcon className="h-8 w-8" />} title="No trip records found" message={period.active || tdf.active ? `No trips match the current filters (${period.periodLabel}).` : "Import your spreadsheet or add a new record."} />
         </div>
       ) : isCSL ? (
         <div className="card table-wrapper overflow-x-auto">
