@@ -5,6 +5,7 @@ import { useToast } from '@/components/Toast';
 import { SubAccount } from '@/lib/portals';
 import type { ImportPlan, PlanResult, MergeResult } from '@/lib/mergeImport';
 import { MERGE_RULES, planRecordMerge, applyRecordPlan } from '@/lib/recordMerge';
+import { downloadXlsx, readSheetRows, isExcelFile } from '@/lib/spreadsheet';
 
 interface BulkImportModalProps {
   open: boolean;
@@ -77,6 +78,8 @@ export function BulkImportModal({
 
   const [importing, setImporting] = useState(false);
   const [fileName, setFileName] = useState<string | null>(null);
+  // Rows read from the Excel file (row 0 = headers), or text typed/pasted in Paste mode
+  const [fileRows, setFileRows] = useState<string[][] | null>(null);
   const [rawText, setRawText] = useState('');
   const [mode, setMode] = useState<'upload' | 'paste'>('upload');
   const [plans, setPlans] = useState<ImportPlan[] | null>(null);
@@ -87,37 +90,42 @@ export function BulkImportModal({
 
   if (!open) return null;
 
-  // 1. Download CSV Template
+  // 1. Download Excel template
   const downloadTemplate = () => {
-    const headerRow = sampleColumns.join(',');
-    const sampleRowCsv = (sampleRow ?? sampleColumns.map(() => 'sample_value')).join(',');
-    const csvContent = `data:text/csv;charset=utf-8,${headerRow}\n${sampleRowCsv}`;
-    const encodedUri = encodeURI(csvContent);
-    const link = document.createElement('a');
-    link.setAttribute('href', encodedUri);
-    link.setAttribute('download', `${tableName}_template.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    downloadXlsx(`${tableName}_template.xlsx`, sampleColumns, sampleRow);
     showToast('Template downloaded successfully', 'success');
   };
 
-  // 2. Handle File Selection from Computer
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  // 2. Handle file selection: read the first sheet of the Excel file
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
-
-    setFileName(file.name);
-    setPlans(null);
-    const reader = new FileReader();
-    reader.onload = event => {
-      const text = event.target?.result as string;
-      if (text) {
-        setRawText(text);
-      }
-    };
-    reader.readAsText(file);
+    if (!isExcelFile(file)) {
+      showToast('Please choose an Excel file (.xlsx or .xls)', 'error');
+      return;
+    }
+    try {
+      const rows = await readSheetRows(file);
+      setFileName(file.name);
+      setPlans(null);
+      setFileRows(rows);
+    } catch {
+      setFileName(null);
+      setFileRows(null);
+      showToast('Could not read that Excel file. Save it as .xlsx and try again.', 'error');
+    }
   };
+
+  // What the import reads from: the Excel file, or the pasted text
+  const parsePasted = (text: string): string[][] => {
+    const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    if (!lines.length) return [];
+    const delimiter = lines[0].includes('\t') ? '\t' : ',';
+    return lines.map(l => splitCsvLine(l, delimiter).map(v => v.trim().replace(/^["']|["']$/g, '')));
+  };
+  const sourceRows = (): string[][] => (mode === 'paste' ? parsePasted(rawText) : fileRows || []);
+  const hasData = mode === 'paste' ? !!rawText.trim() : !!fileRows && fileRows.length > 0;
 
   // Columns that must stay as text (dates, ids, labels), even if the name contains "trip" or "fuel"
   const TEXT_COLUMNS = new Set([
@@ -155,20 +163,18 @@ export function BulkImportModal({
 
   // Reads the text into records ready to save. Rows that cannot be used are listed in `errors`.
   const buildRecords = (): { items: Item[]; errors: { message?: string }[] } | null => {
-    const lines = rawText.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-    if (lines.length < 2) {
-      showToast('CSV file is empty or missing data rows', 'error');
+    const rows = sourceRows();
+    if (rows.length < 2) {
+      showToast('The file is empty or has no data rows under the headers', 'error');
       return null;
     }
 
-    // Support comma or tab separation
-    const delimiter = lines[0].includes('\t') ? '\t' : ',';
-    const headers = splitCsvLine(lines[0], delimiter).map(h => h.trim().replace(/^["']|["']$/g, ''));
+    const headers = rows[0].map(h => h.trim());
     const items: Item[] = [];
     const errors: { message?: string }[] = [];
 
-    for (let i = 1; i < lines.length; i++) {
-      const values = splitCsvLine(lines[i], delimiter).map(v => v.trim());
+    for (let i = 1; i < rows.length; i++) {
+      const values = rows[i].map(v => v.trim());
       // The per-sub-account trips tables (mcl_trips, csl_trips, ...) keep the data apart by being separate
       // tables and have no sub_account column, so it must not be sent for them.
       const OWN_TRIPS = ['mcl_trips', 'csl_trips', 'tarmal_trips', 'pn_mashru_trips', 'mushroom_trips'];
@@ -266,8 +272,8 @@ export function BulkImportModal({
 
   // 3b. Preview: decide what would happen to every row, save nothing
   const handlePreview = async () => {
-    if (!rawText.trim()) {
-      showToast('Please upload a CSV file or paste data', 'error');
+    if (!hasData) {
+      showToast('Please upload an Excel file or paste data', 'error');
       return;
     }
     setImporting(true);
@@ -358,7 +364,7 @@ export function BulkImportModal({
             <h3 className="text-lg font-bold text-slate-800 uppercase tracking-wide">
               Bulk Import — {tableName.replace(/_/g, ' ')}
             </h3>
-            <p className="text-xs text-slate-500">Download the template, fill it out, and upload your CSV or spreadsheet file.</p>
+            <p className="text-xs text-slate-500">Download the template, fill it out, and upload your Excel file.</p>
           </div>
           <button onClick={onClose} className="rounded-lg p-1.5 text-slate-400 hover:bg-slate-100 hover:text-slate-600 transition-colors">
             <X className="h-5 w-5" />
@@ -372,7 +378,7 @@ export function BulkImportModal({
           <div className="p-4 rounded-xl bg-slate-50 border border-slate-200/80 flex items-center justify-between gap-4">
             <div>
               <span className="text-xs font-bold text-slate-400 uppercase tracking-wider block mb-0.5">Step 1: Get Template</span>
-              <p className="text-sm font-medium text-slate-700">Download our structured CSV template with required columns.</p>
+              <p className="text-sm font-medium text-slate-700">Download our Excel template with the required columns.</p>
             </div>
             <button
               onClick={downloadTemplate}
@@ -386,7 +392,7 @@ export function BulkImportModal({
           {/* Step 2: Choose Upload or Paste Mode */}
           <div className="space-y-3">
             <div className="flex items-center justify-between">
-              <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Step 2: Upload CSV File</span>
+              <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">Step 2: Upload Excel File</span>
               <div className="flex bg-slate-100 p-1 rounded-lg text-xs font-medium">
                 <button
                   onClick={() => setMode('upload')}
@@ -414,7 +420,7 @@ export function BulkImportModal({
                   type="file"
                   ref={fileInputRef}
                   onChange={handleFileChange}
-                  accept=".csv,.txt"
+                  accept=".xlsx,.xls"
                   className="hidden"
                 />
                 {fileName ? (
@@ -430,8 +436,8 @@ export function BulkImportModal({
                     <div className="h-10 w-10 rounded-full bg-slate-100 text-slate-500 flex items-center justify-center">
                       <Upload className="h-5 w-5" />
                     </div>
-                    <p className="text-sm font-semibold text-slate-700">Click to browse your computer for a CSV file</p>
-                    <p className="text-xs text-slate-400">Supports standard .csv formatted spreadsheets</p>
+                    <p className="text-sm font-semibold text-slate-700">Click to browse your computer for an Excel file</p>
+                    <p className="text-xs text-slate-400">Supports .xlsx and .xls files (the first sheet is read)</p>
                   </>
                 )}
               </div>
@@ -507,7 +513,7 @@ export function BulkImportModal({
           </button>
           <button
             onClick={plans ? handleConfirm : handlePreview}
-            disabled={importing || !rawText.trim() || (!!plans && planCount('insert') + planCount('update') === 0)}
+            disabled={importing || !hasData || (!!plans && planCount('insert') + planCount('update') === 0)}
             className="btn-primary flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
             style={{ background: portalColor }}
           >
