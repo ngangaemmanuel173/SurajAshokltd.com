@@ -33,6 +33,13 @@ const weeksStartingIn = (ym: string) => {
   for (; monthOf(d) === ym; d = addDays(d, 7)) out.push(d);
   return out;
 };
+/** Each sub-account keeps its trips in its own table (the date column differs: long-distance trips use Date Loaded). */
+const TRIP_SOURCE: Record<string, { table: string; dateField: string }> = {
+  csl: { table: 'csl_trips', dateField: 'trip_date' },
+  mcl: { table: 'mcl_trips', dateField: 'trip_date' },
+  tarmal: { table: 'tarmal_trips', dateField: 'date_loaded' },
+  pn_mashru: { table: 'pn_mashru_trips', dateField: 'date_loaded' },
+};
 const kes = (n: number) => (n ? n.toLocaleString('en-KE', { maximumFractionDigits: 0 }) : '—');
 const kesFull = (n: number) => `KES ${Number(n || 0).toLocaleString('en-KE', { maximumFractionDigits: 0 })}`;
 
@@ -86,12 +93,26 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
         .gte('allowance_date', weekStart).lte('allowance_date', weekEnd).order('allowance_date', { ascending: true }),
       supabase.from('drivers').select('id, name').eq('sub_account', subAccount).order('name'),
       supabase.from('vehicles').select('id, plate_number').eq('sub_account', subAccount).order('plate_number'),
-      supabase.from('sub_account_trips')
-        .select('id, trip_date, vehicle_id, driver_id, departure_point, arrival_point, mileage_payment, status')
-        .eq('sub_account', subAccount).gte('trip_date', weekStart).lte('trip_date', weekEnd).order('trip_date', { ascending: true }),
+      (() => {
+        const src = TRIP_SOURCE[subAccount];
+        if (!src) {
+          return supabase.from('sub_account_trips').select('*')
+            .eq('sub_account', subAccount).gte('trip_date', weekStart).lte('trip_date', weekEnd).order('trip_date', { ascending: true });
+        }
+        return supabase.from(src.table).select('*')
+          .gte(src.dateField, weekStart).lte(src.dateField, weekEnd).order(src.dateField, { ascending: true });
+      })(),
     ]);
     if (a.error) toast(`Could not load allowances: ${a.error.message}`, 'error');
-    setRows(a.data || []); setDrivers(d.data || []); setVehicles(v.data || []); setTrips(t.data || []);
+    if (t.error) toast(`Could not load trips: ${t.error.message}`, 'error');
+    const dateField = TRIP_SOURCE[subAccount]?.dateField || 'trip_date';
+    // normalise so the rest of the page can rely on trip_date / arrival_point whatever the table calls them
+    const tripRows = (t.data || []).map((x: any) => ({
+      ...x,
+      trip_date: String(x[dateField] ?? x.trip_date ?? '').slice(0, 10),
+      arrival_point: x.arrival_point || x.destination || null,
+    }));
+    setRows(a.data || []); setDrivers(d.data || []); setVehicles(v.data || []); setTrips(tripRows);
     setLoading(false);
   }, [subAccount, weekStart, weekEnd, toast]);
   useEffect(() => { load(); }, [load]);
@@ -99,7 +120,7 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
   const dName = useMemo(() => Object.fromEntries(drivers.map(d => [d.id, d.name])), [drivers]);
   const vName = useMemo(() => Object.fromEntries(vehicles.map(v => [v.id, v.plate_number])), [vehicles]);
   const tripLabel = useCallback((t: any) =>
-    `${fmtDate(t.trip_date)} · ${vName[t.vehicle_id] || '—'} · ${t.departure_point || '?'} → ${t.arrival_point || '?'}`, [vName]);
+    `${fmtDate(t.trip_date)} · ${vName[t.vehicle_id] || '—'} · ${t.departure_point || '?'} → ${t.arrival_point || t.destination || '?'}`, [vName]);
 
   const visible = useMemo(() => rows.filter(r =>
     (driverF === 'all' || r.driver_id === driverF) && (truckF === 'all' || r.vehicle_id === truckF)
@@ -182,26 +203,44 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
     load();
   };
 
-  /** Create an allowance for every trip this week that has a driver and a payment, and has none yet. */
+  /**
+   * Create an allowance for every trip this week that has a driver and none yet.
+   * Trips that carry a saved payment (mileage_payment) use it; for the rest (e.g. CSL trips, which have no
+   * payment field) the user is asked for one allowance amount per trip.
+   */
   const generateFromTrips = async () => {
-    const candidates = trips.filter(t => t.driver_id && Number(t.mileage_payment) > 0 && t.status !== 'cancelled');
-    if (candidates.length === 0) return toast('No trips with a driver and a payment amount this week', 'error');
+    const eligible = trips.filter(t => t.driver_id && t.status !== 'cancelled');
+    if (eligible.length === 0) return toast('No trips with a driver this week', 'error');
     setGenerating(true);
     const { data: existing, error: exErr } = await supabase.from('driver_allowances').select('trip_id')
-      .eq('sub_account', subAccount).in('trip_id', candidates.map(t => t.id));
+      .eq('sub_account', subAccount).in('trip_id', eligible.map(t => t.id));
     if (exErr) { setGenerating(false); return toast(exErr.message, 'error'); }
     const done = new Set((existing || []).map((e: any) => e.trip_id));
-    const fresh = candidates.filter(t => !done.has(t.id));
+    const fresh = eligible.filter(t => !done.has(t.id));
     if (fresh.length === 0) { setGenerating(false); return toast('Every trip this week already has an allowance'); }
-    const total = fresh.reduce((a, t) => a + Number(t.mileage_payment), 0);
-    if (!confirm(`Create ${fresh.length} allowance entr${fresh.length === 1 ? 'y' : 'ies'} from this week's trips (${kesFull(total)})?`)) { setGenerating(false); return; }
-    const { error } = await supabase.from('driver_allowances').insert(fresh.map(t => ({
+
+    const noAmount = fresh.filter(t => !(Number(t.mileage_payment) > 0));
+    let flat = 0;
+    if (noAmount.length > 0) {
+      const answer = window.prompt(
+        `${noAmount.length} of ${fresh.length} trip${fresh.length === 1 ? '' : 's'} this week ha${noAmount.length === 1 ? 's' : 've'} no payment amount saved.\n\n` +
+        `Enter the allowance per trip in KES (or leave empty / Cancel to skip those trips):`, '');
+      flat = Number(String(answer ?? '').replace(/,/g, '')) || 0;
+    }
+    const amountOf = (t: any) => (Number(t.mileage_payment) > 0 ? Number(t.mileage_payment) : flat);
+    const toCreate = fresh.filter(t => amountOf(t) > 0);
+    if (toCreate.length === 0) { setGenerating(false); return toast('No allowances created: the trips have no payment amount', 'error'); }
+
+    const total = toCreate.reduce((a, t) => a + amountOf(t), 0);
+    const skipped = fresh.length - toCreate.length;
+    if (!confirm(`Create ${toCreate.length} allowance entr${toCreate.length === 1 ? 'y' : 'ies'} from this week's trips (${kesFull(total)})?${skipped ? `\n${skipped} trip(s) without an amount will be skipped.` : ''}`)) { setGenerating(false); return; }
+    const { error } = await supabase.from('driver_allowances').insert(toCreate.map(t => ({
       sub_account: subAccount, allowance_date: t.trip_date, driver_id: t.driver_id, vehicle_id: t.vehicle_id || null,
-      trip_id: t.id, trip_ref: tripLabel(t), amount: Number(t.mileage_payment), notes: 'Created from trip', entered_by: who,
+      trip_id: t.id, trip_ref: tripLabel(t), amount: amountOf(t), notes: 'Created from trip', entered_by: who,
     })));
     setGenerating(false);
     if (error) return toast(error.message, 'error');
-    toast(`${fresh.length} allowance${fresh.length === 1 ? '' : 's'} created from trips`);
+    toast(`${toCreate.length} allowance${toCreate.length === 1 ? '' : 's'} created from trips`);
     load();
   };
 
