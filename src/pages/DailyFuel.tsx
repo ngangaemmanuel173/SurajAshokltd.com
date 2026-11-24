@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
+import { WeekSelect, inWeek } from '@/components/PeriodFilter';
 import {
   Fuel as FuelIcon, List, Trash2, ChevronLeft, ChevronRight, Save, Upload, Download, Search, CalendarDays, Table2, X,
 } from 'lucide-react';
@@ -42,6 +43,7 @@ export function DailyFuel({ portalColor }: { portalColor: string }) {
   const [fuelType, setFuelType] = useState<FuelType>('diesel');
   const [date, setDate] = useState(localToday());
   const [month, setMonth] = useState(localToday().slice(0, 7));
+  const [week, setWeek] = useState('all'); // 'all' | Monday of the chosen week (sheet + entries views)
   const [search, setSearch] = useState('');
   const [price, setPrice] = useState(DEFAULT_PRICE.diesel);
   const [costs, setCosts] = useState<Record<string, string>>({});
@@ -72,7 +74,7 @@ export function DailyFuel({ portalColor }: { portalColor: string }) {
   useEffect(() => { load(); }, [load]);
 
   const changeDate = (d: string) => { if (!d) return; setDate(d); setMonth(d.slice(0, 7)); };
-  const changeMonth = (ym: string) => { setMonth(ym); setDate(ym === localToday().slice(0, 7) ? localToday() : `${ym}-01`); };
+  const changeMonth = (ym: string) => { setWeek('all'); setMonth(ym); setDate(ym === localToday().slice(0, 7) ? localToday() : `${ym}-01`); };
 
   // Each truck uses diesel or petrol; only the trucks of the selected fuel are listed
   const typeVehicles = useMemo(() => vehicles.filter(v => (v.fuel_type || 'diesel') === fuelType), [vehicles, fuelType]);
@@ -201,9 +203,11 @@ export function DailyFuel({ portalColor }: { portalColor: string }) {
     return { byVeh, dayTotals, grand };
   }, [records, fuelType]);
   const sheetVehicles = vehicles.filter(v => sheet.byVeh.has(v.id) || (showAllTrucks && (v.fuel_type || 'diesel') === fuelType));
-  const monthCost = records.filter(r => r.fuel_type === fuelType).reduce((s, r) => s + (r.total_cost ?? 0), 0);
+  const monthCost = records.filter(r => r.fuel_type === fuelType && inWeek(r.refuel_date, week)).reduce((s, r) => s + (r.total_cost ?? 0), 0);
 
-  const entryRows = records.filter(r => r.fuel_type === fuelType).sort((a, b) => (a.refuel_date < b.refuel_date ? 1 : a.refuel_date > b.refuel_date ? -1 : 0));
+  const shownDays = useMemo(() => monthDays.filter(d => inWeek(`${month}-${pad(d)}`, week)), [monthDays, month, week]);
+  const shownGrand = useMemo(() => shownDays.reduce((s, d) => s + (sheet.dayTotals.get(d) ?? 0), 0), [shownDays, sheet]);
+  const entryRows = records.filter(r => r.fuel_type === fuelType && inWeek(r.refuel_date, week)).sort((a, b) => (a.refuel_date < b.refuel_date ? 1 : a.refuel_date > b.refuel_date ? -1 : 0));
   const blankCost = entryRows.filter(r => r.total_cost == null && (r.actual_litres ?? 0) > 0);
   const applyPrice = async () => {
     if (!(priceNum > 0)) { showToast('Set a price per litre first (Daily Entry tab)', 'error'); return; }
@@ -375,6 +379,7 @@ export function DailyFuel({ portalColor }: { portalColor: string }) {
             <button className="btn-secondary p-2" onClick={() => changeMonth(shiftMonth(month, -1))} aria-label="Previous month"><ChevronLeft className="h-4 w-4" /></button>
             <h2 className="text-lg font-bold text-slate-800 min-w-[10rem] text-center">{monthLabel(month)}</h2>
             <button className="btn-secondary p-2" onClick={() => changeMonth(shiftMonth(month, 1))} aria-label="Next month"><ChevronRight className="h-4 w-4" /></button>
+            <WeekSelect month={month} value={week} onChange={setWeek} className="input w-52" />
             <label className="flex items-center gap-2 text-sm text-slate-600 ml-4 cursor-pointer">
               <input type="checkbox" checked={showAllTrucks} onChange={e => setShowAllTrucks(e.target.checked)} className="h-4 w-4 rounded border-slate-300" style={{ accentColor: portalColor }} />
               Show trucks with no fuel
@@ -396,18 +401,18 @@ export function DailyFuel({ portalColor }: { portalColor: string }) {
                 <thead>
                   <tr className="bg-slate-50 text-slate-600">
                     <th className="sticky left-0 bg-slate-50 text-left px-3 py-2 border-b border-slate-200 z-10">Truck</th>
-                    {monthDays.map(d => <th key={d} className="px-2 py-2 border-b border-l border-slate-100 font-semibold text-center">{d}</th>)}
+                    {shownDays.map(d => <th key={d} className="px-2 py-2 border-b border-l border-slate-100 font-semibold text-center">{d}</th>)}
                     <th className="px-3 py-2 border-b border-l border-slate-200 text-right">Total</th>
                   </tr>
                 </thead>
                 <tbody>
                   {sheetVehicles.map(v => {
                     const row = sheet.byVeh.get(v.id);
-                    const tot = row ? Array.from(row.values()).reduce((a, b) => a + b, 0) : 0;
+                    const tot = row ? shownDays.reduce((a, d) => a + (row.get(d) ?? 0), 0) : 0;
                     return (
                       <tr key={v.id} className="hover:bg-slate-50">
                         <td className="sticky left-0 bg-white px-3 py-1.5 font-semibold text-slate-800 whitespace-nowrap border-b border-slate-100">{v.plate_number}</td>
-                        {monthDays.map(d => {
+                        {shownDays.map(d => {
                           const l = row?.get(d);
                           return (
                             <td key={d} onClick={() => { setDate(`${month}-${pad(d)}`); setView('entry'); }}
@@ -423,8 +428,8 @@ export function DailyFuel({ portalColor }: { portalColor: string }) {
                   })}
                   <tr className="bg-slate-100 font-bold text-slate-800">
                     <td className="sticky left-0 bg-slate-100 px-3 py-2">TTL FUEL</td>
-                    {monthDays.map(d => <td key={d} className="px-2 py-2 text-center border-l border-slate-200">{sheet.dayTotals.get(d) ? fmt(sheet.dayTotals.get(d)!) : ''}</td>)}
-                    <td className="px-3 py-2 text-right border-l border-slate-200">{fmt(sheet.grand)}</td>
+                    {shownDays.map(d => <td key={d} className="px-2 py-2 text-center border-l border-slate-200">{sheet.dayTotals.get(d) ? fmt(sheet.dayTotals.get(d)!) : ''}</td>)}
+                    <td className="px-3 py-2 text-right border-l border-slate-200">{fmt(shownGrand)}</td>
                   </tr>
                 </tbody>
               </table>
@@ -437,10 +442,11 @@ export function DailyFuel({ portalColor }: { portalColor: string }) {
             <button className="btn-secondary p-2" onClick={() => changeMonth(shiftMonth(month, -1))} aria-label="Previous month"><ChevronLeft className="h-4 w-4" /></button>
             <h2 className="text-lg font-bold text-slate-800 min-w-[10rem] text-center">{monthLabel(month)}</h2>
             <button className="btn-secondary p-2" onClick={() => changeMonth(shiftMonth(month, 1))} aria-label="Next month"><ChevronRight className="h-4 w-4" /></button>
+            <WeekSelect month={month} value={week} onChange={setWeek} className="input w-52" />
             {blankCost.length > 0 && (
               <button className="btn-secondary text-sm" onClick={applyPrice}>Add cost to {blankCost.length} entries without one (KES {priceNum || '?'}/L)</button>
             )}
-            <p className="ml-auto text-sm text-slate-500">{entryRows.length} entries · <b className="text-slate-800">{fmt(sheet.grand)} L</b>{monthCost > 0 ? <> · KES <b className="text-slate-800">{monthCost.toLocaleString()}</b></> : null}</p>
+            <p className="ml-auto text-sm text-slate-500">{entryRows.length} entries · <b className="text-slate-800">{fmt(entryRows.reduce((a, r) => a + (r.actual_litres ?? 0), 0))} L</b>{monthCost > 0 ? <> · KES <b className="text-slate-800">{monthCost.toLocaleString()}</b></> : null}</p>
           </div>
           {entryRows.length === 0 ? (
             <p className="text-sm text-slate-500 py-8 text-center">No {FUEL_LABEL[fuelType].toLowerCase()} recorded in {monthLabel(month)}.</p>
