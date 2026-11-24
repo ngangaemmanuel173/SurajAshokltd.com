@@ -1,5 +1,5 @@
-import { useEffect, useState, useCallback, useMemo } from 'react';
-import { Wallet, Plus, Trash2, X, ChevronLeft, ChevronRight, Download, Zap, Pencil, Upload } from 'lucide-react';
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
+import { Wallet, Plus, Trash2, X, ChevronLeft, ChevronRight, Download, Zap, Pencil, Upload, Settings2 } from 'lucide-react';
 import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/lib/auth';
 import { LoadingSpinner, EmptyState } from '@/components/Shared';
@@ -43,6 +43,70 @@ const TRIP_SOURCE: Record<string, { table: string; dateField: string }> = {
 const kes = (n: number) => (n ? n.toLocaleString('en-KE', { maximumFractionDigits: 0 }) : '—');
 const kesFull = (n: number) => `KES ${Number(n || 0).toLocaleString('en-KE', { maximumFractionDigits: 0 })}`;
 
+/** notes marker: an allowance the system calculated from a trip + the saved rates (recalculated when rates change) */
+const AUTO = 'Auto: from rate';
+/** notes marker: an automatic allowance the user removed; kept at KES 0 so it is not created again */
+const SKIPPED = 'Removed';
+const norm = (v: any) => String(v ?? '').trim().toLowerCase();
+
+/**
+ * Allowance for one trip from the saved rates: the most specific matching rate wins
+ * (From + To  >  only From or only To  >  the default per-trip rate). Falls back to a payment saved on the trip.
+ */
+function amountForTrip(t: any, rates: any[]): number {
+  let best = -1, amt = 0;
+  for (const r of rates) {
+    const f = norm(r.from_place), to = norm(r.to_place);
+    if (f && f !== norm(t.departure_point)) continue;
+    if (to && to !== norm(t.arrival_point || t.destination)) continue;
+    const score = (f ? 1 : 0) + (to ? 1 : 0);
+    if (score > best) { best = score; amt = Number(r.amount) || 0; }
+  }
+  // Older MCL records can hold several trips in one row (trip_1 … trip_13 weights): every trip earns the allowance.
+  let trips = 0;
+  for (let n = 1; n <= 13; n++) if (Number(t[`trip_${n}`]) > 0) trips++;
+  if (best >= 0 && amt > 0) return amt * Math.max(1, trips);
+  return Number(t.mileage_payment) > 0 ? Number(t.mileage_payment) : 0;
+}
+
+/** Creates the missing allowances for these trips (and, with recalc, re-prices the automatic ones). */
+async function syncAllowances(o: {
+  subAccount: string; who: string; trips: any[]; rates: any[]; plate: Record<string, string>; recalc: boolean;
+}): Promise<{ created: number; updated: number; unpriced: number }> {
+  const eligible = o.trips.filter(t => t.driver_id && t.status !== 'cancelled' && t.trip_date);
+  if (eligible.length === 0) return { created: 0, updated: 0, unpriced: 0 };
+  const { data: ex, error } = await supabase.from('driver_allowances').select('id, trip_id, amount, notes')
+    .eq('sub_account', o.subAccount).in('trip_id', eligible.map(t => t.id));
+  if (error) throw error;
+  const byTrip = new Map<string, any>((ex || []).map((e: any) => [e.trip_id, e]));
+  const label = (t: any) => `${t.trip_date} · ${o.plate[t.vehicle_id] || '—'} · ${t.departure_point || '?'} → ${t.arrival_point || t.destination || '?'}`;
+  const toCreate: any[] = [], toUpdate: { id: string; amount: number }[] = [];
+  let unpriced = 0;
+  for (const t of eligible) {
+    const amt = amountForTrip(t, o.rates);
+    const e = byTrip.get(t.id);
+    if (!e) {
+      if (amt > 0) toCreate.push({
+        sub_account: o.subAccount, allowance_date: t.trip_date, driver_id: t.driver_id, vehicle_id: t.vehicle_id || null,
+        trip_id: t.id, trip_ref: label(t), amount: amt, notes: AUTO, entered_by: o.who,
+      });
+      else unpriced++;
+    } else if (o.recalc && e.notes === AUTO && amt > 0 && Number(e.amount) !== amt) {
+      toUpdate.push({ id: e.id, amount: amt });
+    }
+  }
+  if (toCreate.length) {
+    const { error: insErr } = await supabase.from('driver_allowances').insert(toCreate);
+    if (insErr) throw insErr;
+  }
+  if (toUpdate.length) {
+    const res = await Promise.all(toUpdate.map(u => supabase.from('driver_allowances').update({ amount: u.amount }).eq('id', u.id)));
+    const bad = res.find(r => r.error);
+    if (bad?.error) throw bad.error;
+  }
+  return { created: toCreate.length, updated: toUpdate.length, unpriced };
+}
+
 const emptyForm = (date: string, driver = '') => ({
   allowance_date: date, driver_id: driver, vehicle_id: '', trip_id: '', trip_ref: '', amount: '', notes: '',
 });
@@ -85,10 +149,18 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
   const [saving, setSaving] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [isBulkOpen, setIsBulkOpen] = useState(false);
+  const [rates, setRates] = useState<any[]>([]);
+  const [ratesError, setRatesError] = useState('');
+  const [unpriced, setUnpriced] = useState(0);
+  const [ratesOpen, setRatesOpen] = useState(false);
+  const [defaultDraft, setDefaultDraft] = useState('');
+  const [routeDraft, setRouteDraft] = useState<{ key: string; id?: string; from_place: string; to_place: string; amount: string }[]>([]);
+  const [savingRates, setSavingRates] = useState(false);
+  const syncing = useRef(false);
 
   const load = useCallback(async () => {
     setLoading(true);
-    const [a, d, v, t] = await Promise.all([
+    const [a, d, v, t, rt] = await Promise.all([
       supabase.from('driver_allowances').select('*').eq('sub_account', subAccount)
         .gte('allowance_date', weekStart).lte('allowance_date', weekEnd).order('allowance_date', { ascending: true }),
       supabase.from('drivers').select('id, name').eq('sub_account', subAccount).order('name'),
@@ -102,6 +174,7 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
         return supabase.from(src.table).select('*')
           .gte(src.dateField, weekStart).lte(src.dateField, weekEnd).order(src.dateField, { ascending: true });
       })(),
+      supabase.from('allowance_rates').select('*').eq('sub_account', subAccount).order('created_at', { ascending: true }),
     ]);
     if (a.error) toast(`Could not load allowances: ${a.error.message}`, 'error');
     if (t.error) toast(`Could not load trips: ${t.error.message}`, 'error');
@@ -112,9 +185,29 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
       trip_date: String(x[dateField] ?? x.trip_date ?? '').slice(0, 10),
       arrival_point: x.arrival_point || x.destination || null,
     }));
-    setRows(a.data || []); setDrivers(d.data || []); setVehicles(v.data || []); setTrips(tripRows);
+    const rateRows = rt.error ? [] : (rt.data || []);
+    setRates(rateRows); setRatesError(rt.error ? rt.error.message : '');
+    let allowRows: any[] = a.data || [];
+
+    // Allowances are calculated automatically: every trip with a driver that has no allowance yet gets one from the saved rates.
+    if (!rt.error && !syncing.current) {
+      syncing.current = true;
+      try {
+        const plate = Object.fromEntries((v.data || []).map((x: any) => [x.id, x.plate_number]));
+        const res = await syncAllowances({ subAccount, who, trips: tripRows, rates: rateRows, plate, recalc: false });
+        setUnpriced(res.unpriced);
+        if (res.created > 0) {
+          const re = await supabase.from('driver_allowances').select('*').eq('sub_account', subAccount)
+            .gte('allowance_date', weekStart).lte('allowance_date', weekEnd).order('allowance_date', { ascending: true });
+          if (!re.error) allowRows = re.data || allowRows;
+        }
+      } catch (e: any) {
+        toast(`Could not calculate allowances: ${e?.message || e}`, 'error');
+      } finally { syncing.current = false; }
+    }
+    setRows(allowRows); setDrivers(d.data || []); setVehicles(v.data || []); setTrips(tripRows);
     setLoading(false);
-  }, [subAccount, weekStart, weekEnd, toast]);
+  }, [subAccount, weekStart, weekEnd, toast, who]);
   useEffect(() => { load(); }, [load]);
 
   const dName = useMemo(() => Object.fromEntries(drivers.map(d => [d.id, d.name])), [drivers]);
@@ -123,7 +216,7 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
     `${fmtDate(t.trip_date)} · ${vName[t.vehicle_id] || '—'} · ${t.departure_point || '?'} → ${t.arrival_point || t.destination || '?'}`, [vName]);
 
   const visible = useMemo(() => rows.filter(r =>
-    (driverF === 'all' || r.driver_id === driverF) && (truckF === 'all' || r.vehicle_id === truckF)
+    Number(r.amount) > 0 && (driverF === 'all' || r.driver_id === driverF) && (truckF === 'all' || r.vehicle_id === truckF)
   ), [rows, driverF, truckF]);
 
   // driver -> day -> amount
@@ -182,7 +275,8 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
     setSaving(true);
     const payload = {
       allowance_date: form.allowance_date, driver_id: form.driver_id, vehicle_id: form.vehicle_id || null,
-      trip_id: form.trip_id || null, trip_ref: form.trip_ref.trim() || null, amount, notes: form.notes.trim() || null,
+      trip_id: form.trip_id || null, trip_ref: form.trip_ref.trim() || null, amount,
+      notes: (editId && form.notes.trim() === AUTO) ? 'Edited manually' : (form.notes.trim() || null),
     };
     const { error } = editId
       ? await supabase.from('driver_allowances').update(payload).eq('id', editId)
@@ -197,51 +291,85 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
   };
 
   const remove = async (id: string) => {
-    if (!confirm('Delete this allowance entry?')) return;
-    const { error } = await supabase.from('driver_allowances').delete().eq('id', id);
+    const row = rows.find(r => r.id === id);
+    const isAuto = !!row?.trip_id; // linked to a trip: keep a KES 0 marker so the automatic calculation does not add it back
+    if (!confirm(isAuto ? 'Remove this allowance? It belongs to a trip, so it will not be created again automatically.' : 'Delete this allowance entry?')) return;
+    const { error } = isAuto
+      ? await supabase.from('driver_allowances').update({ amount: 0, notes: SKIPPED }).eq('id', id)
+      : await supabase.from('driver_allowances').delete().eq('id', id);
     if (error) return toast(error.message, 'error');
     load();
   };
 
-  /**
-   * Create an allowance for every trip this week that has a driver and none yet.
-   * Trips that carry a saved payment (mileage_payment) use it; for the rest (e.g. CSL trips, which have no
-   * payment field) the user is asked for one allowance amount per trip.
-   */
-  const generateFromTrips = async () => {
-    const eligible = trips.filter(t => t.driver_id && t.status !== 'cancelled');
-    if (eligible.length === 0) return toast('No trips with a driver this week', 'error');
-    setGenerating(true);
-    const { data: existing, error: exErr } = await supabase.from('driver_allowances').select('trip_id')
-      .eq('sub_account', subAccount).in('trip_id', eligible.map(t => t.id));
-    if (exErr) { setGenerating(false); return toast(exErr.message, 'error'); }
-    const done = new Set((existing || []).map((e: any) => e.trip_id));
-    const fresh = eligible.filter(t => !done.has(t.id));
-    if (fresh.length === 0) { setGenerating(false); return toast('Every trip this week already has an allowance'); }
-
-    const noAmount = fresh.filter(t => !(Number(t.mileage_payment) > 0));
-    let flat = 0;
-    if (noAmount.length > 0) {
-      const answer = window.prompt(
-        `${noAmount.length} of ${fresh.length} trip${fresh.length === 1 ? '' : 's'} this week ha${noAmount.length === 1 ? 's' : 've'} no payment amount saved.\n\n` +
-        `Enter the allowance per trip in KES (or leave empty / Cancel to skip those trips):`, '');
-      flat = Number(String(answer ?? '').replace(/,/g, '')) || 0;
-    }
-    const amountOf = (t: any) => (Number(t.mileage_payment) > 0 ? Number(t.mileage_payment) : flat);
-    const toCreate = fresh.filter(t => amountOf(t) > 0);
-    if (toCreate.length === 0) { setGenerating(false); return toast('No allowances created: the trips have no payment amount', 'error'); }
-
-    const total = toCreate.reduce((a, t) => a + amountOf(t), 0);
-    const skipped = fresh.length - toCreate.length;
-    if (!confirm(`Create ${toCreate.length} allowance entr${toCreate.length === 1 ? 'y' : 'ies'} from this week's trips (${kesFull(total)})?${skipped ? `\n${skipped} trip(s) without an amount will be skipped.` : ''}`)) { setGenerating(false); return; }
-    const { error } = await supabase.from('driver_allowances').insert(toCreate.map(t => ({
-      sub_account: subAccount, allowance_date: t.trip_date, driver_id: t.driver_id, vehicle_id: t.vehicle_id || null,
-      trip_id: t.id, trip_ref: tripLabel(t), amount: amountOf(t), notes: 'Created from trip', entered_by: who,
-    })));
-    setGenerating(false);
-    if (error) return toast(error.message, 'error');
-    toast(`${toCreate.length} allowance${toCreate.length === 1 ? '' : 's'} created from trips`);
+  /** Re-prices this week's automatic allowances with the saved rates and creates any that are missing. */
+  const recalcWeek = async (rateRows: any[] = rates) => {
+    if (syncing.current) return;
+    syncing.current = true; setGenerating(true);
+    try {
+      const res = await syncAllowances({ subAccount, who, trips, rates: rateRows, plate: vName, recalc: true });
+      setUnpriced(res.unpriced);
+      toast(res.created || res.updated
+        ? `${res.created} created, ${res.updated} updated from the rates`
+        : 'Everything is already up to date');
+    } catch (e: any) { toast(`Could not calculate allowances: ${e?.message || e}`, 'error'); }
+    finally { syncing.current = false; setGenerating(false); }
     load();
+  };
+
+  /* ------------------------------ rates ------------------------------ */
+  const openRates = () => {
+    const def = rates.find(r => !norm(r.from_place) && !norm(r.to_place));
+    setDefaultDraft(def ? String(def.amount) : '');
+    setRouteDraft(rates.filter(r => r !== def).map(r => ({
+      key: r.id, id: r.id, from_place: r.from_place || '', to_place: r.to_place || '', amount: String(r.amount),
+    })));
+    setRatesOpen(true);
+  };
+  const placeSuggestions = useMemo(() => {
+    const set = new Set<string>();
+    trips.forEach(t => { if (t.departure_point) set.add(t.departure_point); if (t.arrival_point) set.add(t.arrival_point); });
+    rates.forEach(r => { if (r.from_place) set.add(r.from_place); if (r.to_place) set.add(r.to_place); });
+    return Array.from(set).sort();
+  }, [trips, rates]);
+
+  const saveRates = async () => {
+    const def = rates.find(r => !norm(r.from_place) && !norm(r.to_place));
+    const defAmt = Number(defaultDraft) || 0;
+    for (const r of routeDraft) {
+      if (!r.from_place.trim() && !r.to_place.trim()) return toast('Each route rate needs a From or a To place', 'error');
+      if (!(Number(r.amount) > 0)) return toast('Enter an amount for every route rate', 'error');
+    }
+    setSavingRates(true);
+    try {
+      const keepIds = new Set<string>();
+      const ops: PromiseLike<any>[] = [];
+      const clean = (v: string) => v.trim() || null;
+      // default per-trip rate
+      if (defAmt > 0) {
+        if (def) { keepIds.add(def.id); ops.push(supabase.from('allowance_rates').update({ amount: defAmt }).eq('id', def.id)); }
+        else ops.push(supabase.from('allowance_rates').insert({ sub_account: subAccount, from_place: null, to_place: null, amount: defAmt }));
+      }
+      // route rates
+      for (const r of routeDraft) {
+        const row = { from_place: clean(r.from_place), to_place: clean(r.to_place), amount: Number(r.amount) };
+        if (r.id) { keepIds.add(r.id); ops.push(supabase.from('allowance_rates').update(row).eq('id', r.id)); }
+        else ops.push(supabase.from('allowance_rates').insert({ ...row, sub_account: subAccount }));
+      }
+      const removed = rates.filter(r => !keepIds.has(r.id)).map(r => r.id);
+      if (removed.length) ops.push(supabase.from('allowance_rates').delete().in('id', removed));
+      const res = await Promise.all(ops);
+      const bad = res.find((x: any) => x.error);
+      if (bad) throw bad.error;
+      const { data: fresh, error } = await supabase.from('allowance_rates').select('*').eq('sub_account', subAccount).order('created_at', { ascending: true });
+      if (error) throw error;
+      setRates(fresh || []);
+      setRatesOpen(false);
+      toast('Allowance rates saved');
+      // New rates apply to new trips straight away. Offer to re-price the week on screen; other weeks are left as they were.
+      if (confirm('Recalculate this week\'s automatic allowances with the new rates?\n\nOther weeks are not changed, and allowances you edited by hand are kept.')) await recalcWeek(fresh || []);
+      else load();
+    } catch (e: any) { toast(e?.message || 'Could not save the rates', 'error'); }
+    finally { setSavingRates(false); }
   };
 
   const exportCsv = () => {
@@ -264,11 +392,14 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
       <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
         <div className="flex items-center gap-3">
           <div className="flex h-11 w-11 items-center justify-center rounded-xl text-white" style={{ background: portalColor }}><Wallet className="h-6 w-6" /></div>
-          <div><h2 className="text-lg font-bold text-slate-800">Driver Allowances</h2><p className="text-sm text-slate-500">Daily payment allowances after trips · week runs Saturday to Friday</p></div>
+          <div><h2 className="text-lg font-bold text-slate-800">Driver Allowances</h2><p className="text-sm text-slate-500">Allowance per trip is set once under Allowance rates and calculated from the trips · week runs Saturday to Friday</p></div>
         </div>
         <div className="flex flex-wrap gap-2">
-          <button onClick={generateFromTrips} disabled={generating} className="flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50">
-            <Zap className="h-4 w-4" /> {generating ? 'Working...' : 'Create from trips'}
+          <button onClick={openRates} className="flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50">
+            <Settings2 className="h-4 w-4" /> Allowance rates
+          </button>
+          <button onClick={() => recalcWeek()} disabled={generating} className="flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50">
+            <Zap className="h-4 w-4" /> {generating ? 'Working...' : 'Recalculate week'}
           </button>
           <button onClick={exportCsv} disabled={visible.length === 0} className="flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50">
             <Download className="h-4 w-4" /> Export week
@@ -281,6 +412,22 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
           </button>
         </div>
       </div>
+
+      {ratesError ? (
+        <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-700">
+          The allowance rates table is not set up yet ({ratesError}). Run the <b>allowance_rates</b> SQL migration in Supabase, then refresh.
+        </div>
+      ) : rates.length === 0 ? (
+        <div className="flex flex-col sm:flex-row sm:items-center gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
+          <span className="flex-1">No allowance rate is set yet. Enter the allowance per trip once and every trip will get its allowance automatically.</span>
+          <button onClick={openRates} className="rounded-lg px-4 py-2 text-sm font-semibold text-white" style={{ background: portalColor }}>Set allowance rates</button>
+        </div>
+      ) : unpriced > 0 ? (
+        <div className="flex flex-col sm:flex-row sm:items-center gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
+          <span className="flex-1">{unpriced} trip{unpriced === 1 ? '' : 's'} this week {unpriced === 1 ? 'has' : 'have'} no matching allowance rate. Add a default per-trip rate or a rate for that route.</span>
+          <button onClick={openRates} className="rounded-lg px-4 py-2 text-sm font-semibold text-white" style={{ background: portalColor }}>Edit rates</button>
+        </div>
+      ) : null}
 
       {/* Week navigator */}
       <div className="flex flex-col lg:flex-row lg:items-end gap-3">
@@ -362,7 +509,7 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
 
           {/* Entries */}
           {visible.length === 0 ? (
-            <div className="card"><EmptyState icon={<Wallet className="h-8 w-8" />} title="No allowances this week" message="Add an allowance, click a day in the grid, or use “Create from trips”." /></div>
+            <div className="card"><EmptyState icon={<Wallet className="h-8 w-8" />} title="No allowances this week" message="Allowances appear here automatically for trips with a driver once an allowance rate is set. You can also add one by hand or click a day in the grid." /></div>
           ) : (
             <div className="card table-wrapper overflow-x-auto">
               <table className="data-table">
@@ -408,6 +555,45 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
             <div className="flex justify-end gap-2 pt-1">
               <button onClick={() => setOpen(false)} className="rounded-lg border border-slate-300 px-4 py-2 text-sm">Cancel</button>
               <button onClick={save} disabled={saving} className="rounded-lg px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" style={{ background: portalColor }}>{saving ? 'Saving...' : 'Save'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {ratesOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/40" onClick={() => setRatesOpen(false)} />
+          <div className="relative z-10 w-full max-w-xl rounded-2xl bg-white p-5 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto">
+            <div className="flex items-center justify-between"><h3 className="text-base font-bold text-slate-800">Allowance rates</h3><button onClick={() => setRatesOpen(false)}><X className="h-5 w-5 text-slate-400" /></button></div>
+            <p className="text-xs text-slate-500">Set it once. Every trip with a driver gets this allowance automatically. Change a rate any time: new trips use it straight away, and you can choose to recalculate the week on screen.</p>
+            <div>
+              <label className={labelCls}>Allowance per trip (KES) *</label>
+              <input type="number" min="0" value={defaultDraft} onChange={e => setDefaultDraft(e.target.value)} placeholder="e.g. 1500" className={inputCls} />
+            </div>
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <label className={labelCls + ' mb-0'}>Different amount for a route (optional)</label>
+                <button onClick={() => setRouteDraft(d => [...d, { key: String(Date.now() + Math.random()), from_place: '', to_place: '', amount: '' }])}
+                  className="text-xs font-semibold text-blue-600 hover:underline">+ Add route</button>
+              </div>
+              <datalist id="allowance-places">{placeSuggestions.map(p => <option key={p} value={p} />)}</datalist>
+              {routeDraft.length === 0 && <p className="text-xs text-slate-400">No route rates. Every trip uses the amount above.</p>}
+              {routeDraft.map(r => (
+                <div key={r.key} className="grid grid-cols-[1fr_1fr_6rem_auto] gap-2 items-center">
+                  <input list="allowance-places" value={r.from_place} placeholder="From (any)" className={inputCls}
+                    onChange={e => setRouteDraft(d => d.map(x => x.key === r.key ? { ...x, from_place: e.target.value } : x))} />
+                  <input list="allowance-places" value={r.to_place} placeholder="To (any)" className={inputCls}
+                    onChange={e => setRouteDraft(d => d.map(x => x.key === r.key ? { ...x, to_place: e.target.value } : x))} />
+                  <input type="number" min="0" value={r.amount} placeholder="KES" className={inputCls}
+                    onChange={e => setRouteDraft(d => d.map(x => x.key === r.key ? { ...x, amount: e.target.value } : x))} />
+                  <button onClick={() => setRouteDraft(d => d.filter(x => x.key !== r.key))} className="text-slate-400 hover:text-red-600" aria-label="Remove route rate"><Trash2 className="h-4 w-4" /></button>
+                </div>
+              ))}
+              <p className="text-[11px] text-slate-400">The most specific rate wins: From + To, then only From or only To, then the amount per trip. Place names must match the trip's From / To (capital letters do not matter).</p>
+            </div>
+            <div className="flex justify-end gap-2 pt-1">
+              <button onClick={() => setRatesOpen(false)} className="rounded-lg border border-slate-300 px-4 py-2 text-sm">Cancel</button>
+              <button onClick={saveRates} disabled={savingRates} className="rounded-lg px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" style={{ background: portalColor }}>{savingRates ? 'Saving...' : 'Save rates'}</button>
             </div>
           </div>
         </div>
