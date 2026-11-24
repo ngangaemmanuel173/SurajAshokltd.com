@@ -1,644 +1,129 @@
-import { useEffect, useState, useCallback, useMemo, useRef } from 'react';
-import { Wallet, Plus, Trash2, X, ChevronLeft, ChevronRight, Download, Zap, Pencil, Upload, Settings2 } from 'lucide-react';
-import { supabase } from '@/lib/supabase';
-import { useAuth } from '@/lib/auth';
-import { LoadingSpinner, EmptyState } from '@/components/Shared';
-import { useToast } from '@/components/Toast';
-import { SubAccount } from '@/lib/portals';
-import { BulkImportModal } from '@/components/BulkImportModal';
-import { ALLOWANCE_COLUMNS } from '@/lib/importColumns';
-import { resolveNamesToIds } from '@/lib/importLookups';
+import { downloadXlsx } from '@/lib/spreadsheet';
+import { TYRE_TEMPLATE_COLUMNS } from '@/lib/tyreTemplate';
+import {
+  CSL_TRIP_COLUMNS, LONG_TRIP_COLUMNS, TARMAL_TRIP_COLUMNS, FUEL_COLUMNS, TALLY_COLUMNS, CONTAINER_COLUMNS,
+  VEHICLE_COMPLIANCE_COLUMNS, DRIVER_COMPLIANCE_COLUMNS, DRIVER_COLUMNS, VEHICLE_COLUMNS, ALLOWANCE_COLUMNS,
+  REVENUE_COLUMNS, TRUCK_COST_COLUMNS, COST_ENTRY_COLUMNS, SALARY_COLUMNS,
+} from '@/lib/importColumns';
 
-const inputCls = 'w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 outline-none focus:border-slate-500';
-const labelCls = 'block text-xs font-semibold text-slate-600 mb-1';
+export type TemplateName =
+  | 'trips' | 'trips_tahmal' | 'fuel' | 'tallies' | 'spare_parts' | 'spare_part_history'
+  | 'containers' | 'drivers' | 'vehicles' | 'work_records' | 'staff' | 'payroll'
+  | 'weighbridge' | 'client_deliveries' | 'tyres' | 'vehicle_compliance'
+  | 'driver_compliance' | 'products' | 'rate_matrix' | 'daily_dispatch'
+  | 'trips_csl' | 'trips_long' | 'trips_tarmal_long' | 'fuel_import' | 'fuel_daily' | 'tallies_import'
+  | 'driver_allowances' | 'truck_revenue' | 'truck_costs' | 'cost_entries' | 'driver_salaries' | 'users';
 
-/* ---------- date helpers (all local time, "YYYY-MM-DD" strings) ---------- */
-const pad = (n: number) => String(n).padStart(2, '0');
-const toStr = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-const parseStr = (s: string) => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
-const addDays = (s: string, n: number) => { const d = parseStr(s); d.setDate(d.getDate() + n); return toStr(d); };
-const todayStr = () => toStr(new Date());
-/** The allowance week runs Saturday → Friday. JS getDay(): Sun=0 … Sat=6, so Saturday offset is 0. */
-const weekStartOf = (s: string) => addDays(s, -((parseStr(s).getDay() + 1) % 7));
-const fmtDate = (s?: string | null) => (s ? parseStr(s).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) : '—');
-const dayName = (s: string) => parseStr(s).toLocaleDateString('en-GB', { weekday: 'short' });
-const dayShort = (s: string) => parseStr(s).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
-const monthOf = (s: string) => s.slice(0, 7);
-const monthName = (ym: string) => { const [y, m] = ym.split('-').map(Number); return new Date(y, m - 1, 1).toLocaleString('en-GB', { month: 'long', year: 'numeric' }); };
-/** Allowance weeks (Sat → Fri) that START inside the given "YYYY-MM" month */
-const weeksStartingIn = (ym: string) => {
-  const out: string[] = [];
-  let d = `${ym}-01`;
-  while (weekStartOf(d) !== d) d = addDays(d, 1);          // first Saturday of the month
-  for (; monthOf(d) === ym; d = addDays(d, 7)) out.push(d);
-  return out;
+const HEADERS: Record<TemplateName, string[]> = {
+  trips: [
+    'Date', 'Truck Plate', 'Trailer No', 'Driver Name', 'Departure Point', 'Arrival Point',
+    'Net Tallage', 'Fuel Expected (L)', 'Fuel Actual (L)', 'Fuel Date', 'Trips Since Refuel',
+    'Fuel Cost (KES)', 'Mileage Payment (KES)', 'Labour Cost (KES)', 'Other Costs (KES)', 'Status', 'Notes',
+  ],
+  trips_tahmal: [
+    'Date', 'Truck Plate', 'Trailer No', 'Driver Name', 'Departure Point', 'Destination',
+    'Start Odometer', 'End Odometer', 'Distance KM', 'Fuel Expected (L)', 'Fuel Actual (L)',
+    'Fuel Date', 'Trips Since Refuel', 'Fuel Cost (KES)', 'Mileage Payment (KES)', 'Labour Cost (KES)', 'Status', 'Notes',
+  ],
+  trips_csl: CSL_TRIP_COLUMNS,
+  trips_long: LONG_TRIP_COLUMNS,
+  trips_tarmal_long: TARMAL_TRIP_COLUMNS,
+  fuel_import: FUEL_COLUMNS,
+  // CSL / Tarmal daily fuel record: the same three columns as the petrol list (DATE, VEHICLE, LITRES)
+  fuel_daily: ['DATE', 'VEHICLE', 'LITRES'],
+  tallies_import: TALLY_COLUMNS,
+  fuel: [
+    'Date', 'Truck Plate', 'Trailer No', 'Driver', 'From', 'Destination', 'Expected Litres', 'Actual Litres',
+    'Cost per Litre (KES)', 'Total Cost (KES)', 'Trips Since Last Refuel', 'Linked Trip Date', 'Notes',
+  ],
+  tallies: [
+    'Date', 'Truck Plate', 'Trailer No', 'Driver', 'Net Tallage', 'Linked Trip Date', 'Area (MCL only)', 'Notes',
+  ],
+  spare_parts: [
+    'Serial Number', 'Part Name', 'Category (battery/general/miscellaneous)', 'Part Type (new/rebound)',
+    'Status (in_store/in_use/under_repair/retired)', 'Supplier', 'Purchase Date', 'Unit Cost (KES)',
+    'Current Truck', 'Installed Date', 'Last Changed Date', 'Notes',
+  ],
+  spare_part_history: [
+    'Serial Number', 'Action', 'Date', 'Truck Plate', 'Duration (days)', 'Reason', 'Performed By', 'Notes',
+  ],
+  containers: CONTAINER_COLUMNS,
+  drivers: DRIVER_COLUMNS,
+  vehicles: VEHICLE_COLUMNS,
+  work_records: [
+    'Date', 'Vehicle Plate', 'Description', 'Work Type', 'Hours Worked', 'Labour Cost (KES)',
+    'Parts Cost (KES)', 'Performed By', 'Status', 'Notes',
+  ],
+  staff: [
+    'Name', 'Designation', 'KRA PIN', 'NSSF Number', 'SHA Number', 'National ID',
+    'Phone Number', 'Status', 'Notes',
+  ],
+  payroll: [
+    'Payee Name', 'Pay Date', 'Pay Period Start', 'Pay Period End', 'Gross Salary (KES)',
+    'Deductions (KES)', 'Net Salary (KES)', 'Payment Method', 'Status', 'Notes',
+  ],
+  weighbridge: [
+    'Date', 'Ticket No', 'Lorry No', 'Goods', 'Lot/Route/Consignee', 'Qty Units', 'Weight (KG)', 'Notes',
+  ],
+  client_deliveries: [
+    'Date', 'Client Name', 'Item Code', 'Description', 'Packaging', 'Volume/Weight',
+    'Order Qty', 'Unit Price (KES)', 'Net Amount (KES)', 'Tax Amount (KES)', 'Total Amount (KES)',
+    'Invoice No', 'Delivery No', 'Status',
+  ],
+  tyres: TYRE_TEMPLATE_COLUMNS,
+  vehicle_compliance: VEHICLE_COMPLIANCE_COLUMNS,
+  driver_compliance: DRIVER_COMPLIANCE_COLUMNS,
+  products: [
+    'Item Code', 'Description', 'Packaging', 'Volume/Weight', 'Unit Price (KES)', 'Status',
+  ],
+  rate_matrix: [
+    'Origin', 'Destination', 'Rate Amount (KES)', 'Is Bidirectional',
+  ],
+  daily_dispatch: [
+    'Date', 'Truck Plate', 'Driver Name', 'Route', 'Cargo Type', 'Trip Status', 'Notes',
+  ],
+  driver_allowances: ALLOWANCE_COLUMNS,
+  truck_revenue: REVENUE_COLUMNS,
+  truck_costs: TRUCK_COST_COLUMNS,
+  cost_entries: COST_ENTRY_COLUMNS,
+  driver_salaries: SALARY_COLUMNS,
+  users: ['Full Name', 'Email', 'Role (employee/manager/corporate_admin/spares_clerk/reports_clerk)', 'Sub-Account'],
 };
-/** Each sub-account keeps its trips in its own table (the date column differs: long-distance trips use Date Loaded). */
-const TRIP_SOURCE: Record<string, { table: string; dateField: string }> = {
-  csl: { table: 'csl_trips', dateField: 'trip_date' },
-  mcl: { table: 'mcl_trips', dateField: 'trip_date' },
-  tarmal: { table: 'tarmal_trips', dateField: 'date_loaded' },
-  pn_mashru: { table: 'pn_mashru_trips', dateField: 'date_loaded' },
+
+export const TEMPLATE_LABELS: Record<TemplateName, string> = {
+  trips: 'Trips', trips_tahmal: 'Trips (Tarmal)', trips_csl: 'Trips', trips_long: 'Trips', trips_tarmal_long: 'Trips', fuel_import: 'Fuel', fuel_daily: 'Fuel (daily record)', tallies_import: 'Tallies', fuel: 'Fuel', tallies: 'Tallies', spare_parts: 'Spare parts',
+  spare_part_history: 'Spare part history', containers: 'Containers', drivers: 'Drivers', vehicles: 'Trucks / Vehicles',
+  work_records: 'Work records', staff: 'Staff', payroll: 'Payroll', weighbridge: 'Weighbridge', client_deliveries: 'Client deliveries',
+  tyres: 'Tyres', vehicle_compliance: 'Vehicle compliance', driver_compliance: 'Driver compliance', products: 'Products',
+  rate_matrix: 'Rate matrix', daily_dispatch: 'Daily dispatch', driver_allowances: 'Driver allowances', truck_revenue: 'Truck revenue', truck_costs: 'Insurance, loans & driver allowance',
+  cost_entries: 'Cost entries (financial / employment / overhead)', driver_salaries: 'Driver salaries', users: 'Users',
 };
-const kes = (n: number) => (n ? n.toLocaleString('en-KE', { maximumFractionDigits: 0 }) : '—');
-const kesFull = (n: number) => `KES ${Number(n || 0).toLocaleString('en-KE', { maximumFractionDigits: 0 })}`;
 
-/** notes marker: an allowance the system calculated from a trip + the saved rates (recalculated when rates change) */
-const AUTO = 'Auto: from rate';
-/** notes marker: an automatic allowance the user removed; kept at KES 0 so it is not created again */
-const SKIPPED = 'Removed';
-const norm = (v: any) => String(v ?? '').trim().toLowerCase();
-
-/**
- * Allowance for one trip from the saved rates (by product and/or route): the most specific matching rate wins
- * (Product + route  >  Product or route  >  the default per-trip rate). Falls back to a payment saved on the trip.
- */
-function amountForTrip(t: any, rates: any[]): number {
-  let best = -1, amt = 0;
-  for (const r of rates) {
-    const pr = norm(r.product), f = norm(r.from_place), to = norm(r.to_place);
-    if (pr && pr !== norm(t.product || t.item)) continue;
-    if (f && f !== norm(t.departure_point)) continue;
-    if (to && to !== norm(t.arrival_point || t.destination)) continue;
-    const score = (pr ? 1 : 0) + (f ? 1 : 0) + (to ? 1 : 0);
-    if (score > best) { best = score; amt = Number(r.amount) || 0; }
+/** Which templates belong to which page (tab). Every page has at least one. */
+export function templatesForTab(tab: string, portalSlug: string): TemplateName[] {
+  if (tab.startsWith('spares-')) return ['spare_parts', 'spare_part_history'];
+  switch (tab) {
+    case 'trips': return [portalSlug === 'csl' ? 'trips_csl' : portalSlug === 'pn_mashru' ? 'trips_long' : portalSlug === 'tarmal' ? 'trips_tarmal_long' : 'trips'];
+    case 'fuel': return [portalSlug === 'mcl' ? 'fuel' : (portalSlug === 'csl' || portalSlug === 'tarmal') ? 'fuel_daily' : 'fuel_import'];
+    case 'allowances': return ['driver_allowances'];
+    case 'tallies': return [portalSlug === 'mcl' ? 'tallies' : 'tallies_import'];
+    case 'drivers': return ['drivers'];
+    case 'vehicles': return ['vehicles'];
+    case 'spare-parts': return ['spare_parts', 'spare_part_history'];
+    case 'tyres': return ['tyres'];
+    case 'containers': return ['containers'];
+    case 'compliance': return ['vehicle_compliance', 'driver_compliance'];
+    case 'reports':
+    case 'cost-reports': return ['truck_revenue', 'truck_costs', 'cost_entries', 'driver_salaries'];
+    case 'users': return ['users'];
+    case 'live-monitor': return ['daily_dispatch'];
+    default: return ['trips', 'fuel', 'driver_allowances']; // dashboards / overview / sub-account tabs
   }
-  // Older MCL records can hold several trips in one row (trip_1 … trip_13 weights): every trip earns the allowance.
-  let trips = 0;
-  for (let n = 1; n <= 13; n++) if (Number(t[`trip_${n}`]) > 0) trips++;
-  if (best >= 0 && amt > 0) return amt * Math.max(1, trips);
-  return Number(t.mileage_payment) > 0 ? Number(t.mileage_payment) : 0;
 }
 
-/** Creates the missing allowances for these trips (and, with recalc, re-prices the automatic ones). */
-async function syncAllowances(o: {
-  subAccount: string; who: string; trips: any[]; rates: any[]; plate: Record<string, string>; recalc: boolean;
-}): Promise<{ created: number; updated: number; unpriced: number }> {
-  const eligible = o.trips.filter(t => t.driver_id && t.status !== 'cancelled' && t.trip_date);
-  if (eligible.length === 0) return { created: 0, updated: 0, unpriced: 0 };
-  const { data: ex, error } = await supabase.from('driver_allowances').select('id, trip_id, amount, notes')
-    .eq('sub_account', o.subAccount).in('trip_id', eligible.map(t => t.id));
-  if (error) throw error;
-  const byTrip = new Map<string, any>((ex || []).map((e: any) => [e.trip_id, e]));
-  const label = (t: any) => `${t.trip_date} · ${o.plate[t.vehicle_id] || '—'} · ${t.departure_point || '?'} → ${t.arrival_point || t.destination || '?'}`;
-  const toCreate: any[] = [], toUpdate: { id: string; amount: number }[] = [];
-  let unpriced = 0;
-  for (const t of eligible) {
-    const amt = amountForTrip(t, o.rates);
-    const e = byTrip.get(t.id);
-    if (!e) {
-      if (amt > 0) toCreate.push({
-        sub_account: o.subAccount, allowance_date: t.trip_date, driver_id: t.driver_id, vehicle_id: t.vehicle_id || null,
-        trip_id: t.id, trip_ref: label(t), amount: amt, notes: AUTO, entered_by: o.who,
-      });
-      else unpriced++;
-    } else if (o.recalc && e.notes === AUTO && amt > 0 && Number(e.amount) !== amt) {
-      toUpdate.push({ id: e.id, amount: amt });
-    }
-  }
-  if (toCreate.length) {
-    const { error: insErr } = await supabase.from('driver_allowances').insert(toCreate);
-    if (insErr) throw insErr;
-  }
-  if (toUpdate.length) {
-    const res = await Promise.all(toUpdate.map(u => supabase.from('driver_allowances').update({ amount: u.amount }).eq('id', u.id)));
-    const bad = res.find(r => r.error);
-    if (bad?.error) throw bad.error;
-  }
-  return { created: toCreate.length, updated: toUpdate.length, unpriced };
-}
-
-const emptyForm = (date: string, driver = '') => ({
-  allowance_date: date, driver_id: driver, vehicle_id: '', trip_id: '', trip_ref: '', amount: '', notes: '',
-});
-
-/**
- * Operations team: daily payment allowances for drivers after their trips.
- * The week runs Saturday to Friday; the grid shows each driver's allowance per day and the weekly total.
- */
-export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor: string; subAccount: SubAccount }) {
-  const { showToast } = useToast();
-  const { profile } = useAuth();
-  const toast = useCallback((m: string, t: 'success' | 'error' = 'success') => (showToast as any)(m, t), [showToast]);
-  const who = (profile as any)?.full_name || (profile as any)?.email || 'Unknown';
-
-  const [weekStart, setWeekStart] = useState(() => weekStartOf(todayStr()));
-  const days = useMemo(() => Array.from({ length: 7 }, (_, i) => addDays(weekStart, i)), [weekStart]);
-  const selMonth = monthOf(weekStart);
-  const monthChoices = useMemo(() => {
-    const now = new Date();
-    const list: string[] = [];
-    for (let i = 0; i < 18; i++) { const d = new Date(now.getFullYear(), now.getMonth() - i, 1); list.push(`${d.getFullYear()}-${pad(d.getMonth() + 1)}`); }
-    if (!list.includes(selMonth)) list.push(selMonth);
-    return list.sort().reverse();
-  }, [selMonth]);
-  const weekChoices = useMemo(() => weeksStartingIn(selMonth), [selMonth]);
-  const weekEnd = days[6];
-
-  const [loading, setLoading] = useState(true);
-  const [rows, setRows] = useState<any[]>([]);
-  const [drivers, setDrivers] = useState<any[]>([]);
-  const [vehicles, setVehicles] = useState<any[]>([]);
-  const [trips, setTrips] = useState<any[]>([]);
-  const [driverF, setDriverF] = useState('all');
-  const [truckF, setTruckF] = useState('all');
-  const [onlyPaid, setOnlyPaid] = useState(false);
-
-  const [open, setOpen] = useState(false);
-  const [editId, setEditId] = useState<string | null>(null);
-  const [form, setForm] = useState(emptyForm(todayStr()));
-  const [saving, setSaving] = useState(false);
-  const [generating, setGenerating] = useState(false);
-  const [isBulkOpen, setIsBulkOpen] = useState(false);
-  const [rates, setRates] = useState<any[]>([]);
-  const [ratesError, setRatesError] = useState('');
-  const [unpriced, setUnpriced] = useState(0);
-  const [ratesOpen, setRatesOpen] = useState(false);
-  const [defaultDraft, setDefaultDraft] = useState('');
-  const [routeDraft, setRouteDraft] = useState<{ key: string; id?: string; product: string; from_place: string; to_place: string; amount: string }[]>([]);
-  const [productOptions, setProductOptions] = useState<string[]>([]);
-  const byProduct = subAccount !== 'mcl'; // CSL (and the long-distance accounts) pay by product; MCL pays by route
-  const [savingRates, setSavingRates] = useState(false);
-  const syncing = useRef(false);
-
-  const load = useCallback(async () => {
-    setLoading(true);
-    const [a, d, v, t, rt] = await Promise.all([
-      supabase.from('driver_allowances').select('*').eq('sub_account', subAccount)
-        .gte('allowance_date', weekStart).lte('allowance_date', weekEnd).order('allowance_date', { ascending: true }),
-      supabase.from('drivers').select('id, name').eq('sub_account', subAccount).order('name'),
-      supabase.from('vehicles').select('id, plate_number').eq('sub_account', subAccount).order('plate_number'),
-      (() => {
-        const src = TRIP_SOURCE[subAccount];
-        if (!src) {
-          return supabase.from('sub_account_trips').select('*')
-            .eq('sub_account', subAccount).gte('trip_date', weekStart).lte('trip_date', weekEnd).order('trip_date', { ascending: true });
-        }
-        return supabase.from(src.table).select('*')
-          .gte(src.dateField, weekStart).lte(src.dateField, weekEnd).order(src.dateField, { ascending: true });
-      })(),
-      supabase.from('allowance_rates').select('*').eq('sub_account', subAccount).order('created_at', { ascending: true }),
-    ]);
-    if (a.error) toast(`Could not load allowances: ${a.error.message}`, 'error');
-    if (t.error) toast(`Could not load trips: ${t.error.message}`, 'error');
-    const dateField = TRIP_SOURCE[subAccount]?.dateField || 'trip_date';
-    // normalise so the rest of the page can rely on trip_date / arrival_point whatever the table calls them
-    const tripRows = (t.data || []).map((x: any) => ({
-      ...x,
-      trip_date: String(x[dateField] ?? x.trip_date ?? '').slice(0, 10),
-      arrival_point: x.arrival_point || x.destination || null,
-    }));
-    const rateRows = rt.error ? [] : (rt.data || []);
-    setRates(rateRows); setRatesError(rt.error ? rt.error.message : '');
-    let allowRows: any[] = a.data || [];
-
-    // Allowances are calculated automatically: every trip with a driver that has no allowance yet gets one from the saved rates.
-    if (!rt.error && !syncing.current) {
-      syncing.current = true;
-      try {
-        const plate = Object.fromEntries((v.data || []).map((x: any) => [x.id, x.plate_number]));
-        const res = await syncAllowances({ subAccount, who, trips: tripRows, rates: rateRows, plate, recalc: false });
-        setUnpriced(res.unpriced);
-        if (res.created > 0) {
-          const re = await supabase.from('driver_allowances').select('*').eq('sub_account', subAccount)
-            .gte('allowance_date', weekStart).lte('allowance_date', weekEnd).order('allowance_date', { ascending: true });
-          if (!re.error) allowRows = re.data || allowRows;
-        }
-      } catch (e: any) {
-        toast(`Could not calculate allowances: ${e?.message || e}`, 'error');
-      } finally { syncing.current = false; }
-    }
-    setRows(allowRows); setDrivers(d.data || []); setVehicles(v.data || []); setTrips(tripRows);
-    setLoading(false);
-  }, [subAccount, weekStart, weekEnd, toast, who]);
-  useEffect(() => { load(); }, [load]);
-
-  const dName = useMemo(() => Object.fromEntries(drivers.map(d => [d.id, d.name])), [drivers]);
-  const vName = useMemo(() => Object.fromEntries(vehicles.map(v => [v.id, v.plate_number])), [vehicles]);
-  const tripLabel = useCallback((t: any) =>
-    `${fmtDate(t.trip_date)} · ${vName[t.vehicle_id] || '—'} · ${t.departure_point || '?'} → ${t.arrival_point || t.destination || '?'}`, [vName]);
-
-  const visible = useMemo(() => rows.filter(r =>
-    Number(r.amount) > 0 && (driverF === 'all' || r.driver_id === driverF) && (truckF === 'all' || r.vehicle_id === truckF)
-  ), [rows, driverF, truckF]);
-
-  // driver -> day -> amount
-  const grid = useMemo<Record<string, Record<string, number>>>(() => {
-    const m: Record<string, Record<string, number>> = {};
-    visible.forEach(r => {
-      const k = r.driver_id || 'none';
-      m[k] = m[k] || {};
-      m[k][r.allowance_date] = (m[k][r.allowance_date] || 0) + Number(r.amount || 0);
-    });
-    return m;
-  }, [visible]);
-
-  const gridDrivers = useMemo(() => {
-    let list = drivers.filter(d => driverF === 'all' || d.id === driverF).map(d => ({ id: d.id as string, name: d.name as string }));
-    if (grid['none']) list = [...list, { id: 'none', name: 'Unassigned driver' }];
-    if (onlyPaid || truckF !== 'all') list = list.filter(d => grid[d.id]);
-    return list;
-  }, [drivers, driverF, grid, onlyPaid, truckF]);
-
-  const driverTotal = (id: string): number => Object.values<number>(grid[id] || {}).reduce((a, b) => a + b, 0);
-  const dayTotal = (day: string): number => Object.values<Record<string, number>>(grid).reduce((a, g) => a + (g[day] || 0), 0);
-  const weekTotal = visible.reduce((a, r) => a + Number(r.amount || 0), 0);
-  const driversPaid = Object.keys(grid).length;
-
-  /* ------------------------------ form ------------------------------ */
-  const openAdd = (date?: string, driver?: string) => {
-    const d = date || (days.includes(todayStr()) ? todayStr() : weekStart);
-    setEditId(null); setForm(emptyForm(d, driver && driver !== 'none' ? driver : '')); setOpen(true);
-  };
-  const openEdit = (r: any) => {
-    setEditId(r.id);
-    setForm({
-      allowance_date: r.allowance_date, driver_id: r.driver_id || '', vehicle_id: r.vehicle_id || '', trip_id: r.trip_id || '',
-      trip_ref: r.trip_ref || '', amount: r.amount != null ? String(r.amount) : '', notes: r.notes || '',
-    });
-    setOpen(true);
-  };
-  const pickTrip = (id: string) => {
-    const t = trips.find(x => x.id === id);
-    setForm(f => ({
-      ...f, trip_id: id,
-      trip_ref: t ? tripLabel(t) : f.trip_ref,
-      vehicle_id: t?.vehicle_id || f.vehicle_id,
-      driver_id: t?.driver_id || f.driver_id,
-      allowance_date: t?.trip_date || f.allowance_date,
-      amount: t && !f.amount && Number(t.mileage_payment) > 0 ? String(t.mileage_payment) : f.amount,
-    }));
-  };
-
-  const save = async () => {
-    const amount = Number(form.amount);
-    if (!form.driver_id) return toast('Choose the driver', 'error');
-    if (!form.allowance_date) return toast('Choose the date', 'error');
-    if (!amount || amount <= 0) return toast('Enter the allowance amount', 'error');
-    setSaving(true);
-    const payload = {
-      allowance_date: form.allowance_date, driver_id: form.driver_id, vehicle_id: form.vehicle_id || null,
-      trip_id: form.trip_id || null, trip_ref: form.trip_ref.trim() || null, amount,
-      notes: (editId && form.notes.trim() === AUTO) ? 'Edited manually' : (form.notes.trim() || null),
-    };
-    const { error } = editId
-      ? await supabase.from('driver_allowances').update(payload).eq('id', editId)
-      : await supabase.from('driver_allowances').insert({ ...payload, sub_account: subAccount, entered_by: who });
-    setSaving(false);
-    if (error) return toast(error.message, 'error');
-    toast(editId ? 'Allowance updated' : 'Allowance saved');
-    setOpen(false);
-    // jump to the week the entry belongs to if the date was changed outside the visible week
-    const ws = weekStartOf(form.allowance_date);
-    if (ws !== weekStart) setWeekStart(ws); else load();
-  };
-
-  const remove = async (id: string) => {
-    const row = rows.find(r => r.id === id);
-    const isAuto = !!row?.trip_id; // linked to a trip: keep a KES 0 marker so the automatic calculation does not add it back
-    if (!confirm(isAuto ? 'Remove this allowance? It belongs to a trip, so it will not be created again automatically.' : 'Delete this allowance entry?')) return;
-    const { error } = isAuto
-      ? await supabase.from('driver_allowances').update({ amount: 0, notes: SKIPPED }).eq('id', id)
-      : await supabase.from('driver_allowances').delete().eq('id', id);
-    if (error) return toast(error.message, 'error');
-    load();
-  };
-
-  /** Re-prices this week's automatic allowances with the saved rates and creates any that are missing. */
-  const recalcWeek = async (rateRows: any[] = rates) => {
-    if (syncing.current) return;
-    syncing.current = true; setGenerating(true);
-    try {
-      const res = await syncAllowances({ subAccount, who, trips, rates: rateRows, plate: vName, recalc: true });
-      setUnpriced(res.unpriced);
-      toast(res.created || res.updated
-        ? `${res.created} created, ${res.updated} updated from the rates`
-        : 'Everything is already up to date');
-    } catch (e: any) { toast(`Could not calculate allowances: ${e?.message || e}`, 'error'); }
-    finally { syncing.current = false; setGenerating(false); }
-    load();
-  };
-
-  /* ------------------------------ rates ------------------------------ */
-  const openRates = () => {
-    const def = rates.find(r => !norm(r.product) && !norm(r.from_place) && !norm(r.to_place));
-    setDefaultDraft(def ? String(def.amount) : '');
-    setRouteDraft(rates.filter(r => r !== def).map(r => ({
-      key: r.id, id: r.id, product: r.product || '', from_place: r.from_place || '', to_place: r.to_place || '', amount: String(r.amount),
-    })));
-    setRatesOpen(true);
-    // every product used on this sub-account's trips, so they can be picked from the list
-    const src = TRIP_SOURCE[subAccount];
-    if (byProduct && src) {
-      supabase.from(src.table).select('*').limit(3000).then(({ data }: any) => {
-        const set = new Set<string>();
-        (data || []).forEach((x: any) => { const v = String(x.product || x.item || '').trim(); if (v) set.add(v.toUpperCase()); });
-        setProductOptions(Array.from(set).sort());
-      });
-    }
-  };
-  const placeSuggestions = useMemo(() => {
-    const set = new Set<string>();
-    trips.forEach(t => { if (t.departure_point) set.add(t.departure_point); if (t.arrival_point) set.add(t.arrival_point); });
-    rates.forEach(r => { if (r.from_place) set.add(r.from_place); if (r.to_place) set.add(r.to_place); });
-    return Array.from(set).sort();
-  }, [trips, rates]);
-  const productSuggestions = useMemo(() => {
-    const set = new Set<string>(productOptions);
-    trips.forEach(t => { const v = String(t.product || t.item || '').trim(); if (v) set.add(v.toUpperCase()); });
-    rates.forEach(r => { if (r.product) set.add(String(r.product).toUpperCase()); });
-    return Array.from(set).sort();
-  }, [productOptions, trips, rates]);
-
-  const saveRates = async () => {
-    const def = rates.find(r => !norm(r.product) && !norm(r.from_place) && !norm(r.to_place));
-    const defAmt = Number(defaultDraft) || 0;
-    for (const r of routeDraft) {
-      if (!r.product.trim() && !r.from_place.trim() && !r.to_place.trim()) return toast(byProduct ? 'Each rate needs a product or a From / To place' : 'Each route rate needs a From or a To place', 'error');
-      if (!(Number(r.amount) > 0)) return toast('Enter an amount for every route rate', 'error');
-    }
-    setSavingRates(true);
-    try {
-      const keepIds = new Set<string>();
-      const ops: PromiseLike<any>[] = [];
-      const clean = (v: string) => v.trim() || null;
-      // default per-trip rate
-      if (defAmt > 0) {
-        if (def) { keepIds.add(def.id); ops.push(supabase.from('allowance_rates').update({ amount: defAmt }).eq('id', def.id)); }
-        else ops.push(supabase.from('allowance_rates').insert({ sub_account: subAccount, product: null, from_place: null, to_place: null, amount: defAmt }));
-      }
-      // route rates
-      for (const r of routeDraft) {
-        const row = { product: clean(r.product), from_place: clean(r.from_place), to_place: clean(r.to_place), amount: Number(r.amount) };
-        if (r.id) { keepIds.add(r.id); ops.push(supabase.from('allowance_rates').update(row).eq('id', r.id)); }
-        else ops.push(supabase.from('allowance_rates').insert({ ...row, sub_account: subAccount }));
-      }
-      const removed = rates.filter(r => !keepIds.has(r.id)).map(r => r.id);
-      if (removed.length) ops.push(supabase.from('allowance_rates').delete().in('id', removed));
-      const res = await Promise.all(ops);
-      const bad = res.find((x: any) => x.error);
-      if (bad) throw bad.error;
-      const { data: fresh, error } = await supabase.from('allowance_rates').select('*').eq('sub_account', subAccount).order('created_at', { ascending: true });
-      if (error) throw error;
-      setRates(fresh || []);
-      setRatesOpen(false);
-      toast('Allowance rates saved');
-      // New rates apply to new trips straight away. Offer to re-price the week on screen; other weeks are left as they were.
-      if (confirm('Recalculate this week\'s automatic allowances with the new rates?\n\nOther weeks are not changed, and allowances you edited by hand are kept.')) await recalcWeek(fresh || []);
-      else load();
-    } catch (e: any) { toast(e?.message || 'Could not save the rates', 'error'); }
-    finally { setSavingRates(false); }
-  };
-
-  const exportCsv = () => {
-    const head = ['Driver', ...days.map(d => `${dayName(d)} ${dayShort(d)}`), 'Week total (KES)'];
-    const lines = gridDrivers.filter(d => grid[d.id]).map(d =>
-      [d.name, ...days.map(day => grid[d.id]?.[day] || 0), driverTotal(d.id)]);
-    lines.push(['TOTAL', ...days.map(dayTotal), weekTotal]);
-    const csv = [head, ...lines].map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
-    const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
-    const a = document.createElement('a');
-    a.href = url; a.download = `driver-allowances_${subAccount}_${weekStart}_to_${weekEnd}.csv`; a.click();
-    URL.revokeObjectURL(url);
-  };
-
-  const isThisWeek = weekStart === weekStartOf(todayStr());
-  const today = todayStr();
-
-  return (
-    <div className="space-y-5 animate-fade-in">
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 bg-white p-6 rounded-2xl border border-slate-200 shadow-sm">
-        <div className="flex items-center gap-3">
-          <div className="flex h-11 w-11 items-center justify-center rounded-xl text-white" style={{ background: portalColor }}><Wallet className="h-6 w-6" /></div>
-          <div><h2 className="text-lg font-bold text-slate-800">Driver Allowances</h2><p className="text-sm text-slate-500">Allowance per trip is set once under Allowance rates and calculated from the trips · week runs Saturday to Friday</p></div>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          <button onClick={openRates} className="flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50">
-            <Settings2 className="h-4 w-4" /> Allowance rates
-          </button>
-          <button onClick={() => recalcWeek()} disabled={generating} className="flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50">
-            <Zap className="h-4 w-4" /> {generating ? 'Working...' : 'Recalculate week'}
-          </button>
-          <button onClick={exportCsv} disabled={visible.length === 0} className="flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50">
-            <Download className="h-4 w-4" /> Export week
-          </button>
-          <button onClick={() => setIsBulkOpen(true)} className="flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 hover:bg-slate-50">
-            <Upload className="h-4 w-4" /> Bulk Import
-          </button>
-          <button onClick={() => openAdd()} className="flex items-center gap-2 rounded-lg px-4 py-2.5 text-sm font-semibold text-white" style={{ background: portalColor }}>
-            <Plus className="h-4 w-4" /> Add Allowance
-          </button>
-        </div>
-      </div>
-
-      {ratesError ? (
-        <div className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-700">
-          The allowance rates table is not set up yet ({ratesError}). Run the <b>allowance_rates</b> SQL migration in Supabase, then refresh.
-        </div>
-      ) : rates.length === 0 ? (
-        <div className="flex flex-col sm:flex-row sm:items-center gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
-          <span className="flex-1">No allowance rate is set yet. {byProduct ? 'Enter the allowance for each product' : 'Enter the allowance for each route'} once and every trip will get its allowance automatically.</span>
-          <button onClick={openRates} className="rounded-lg px-4 py-2 text-sm font-semibold text-white" style={{ background: portalColor }}>Set allowance rates</button>
-        </div>
-      ) : unpriced > 0 ? (
-        <div className="flex flex-col sm:flex-row sm:items-center gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
-          <span className="flex-1">{unpriced} trip{unpriced === 1 ? '' : 's'} this week {unpriced === 1 ? 'has' : 'have'} no matching allowance rate. {byProduct ? 'Add a rate for that product, or a default amount.' : 'Add a rate for that route.'}</span>
-          <button onClick={openRates} className="rounded-lg px-4 py-2 text-sm font-semibold text-white" style={{ background: portalColor }}>Edit rates</button>
-        </div>
-      ) : null}
-
-      {/* Week navigator */}
-      <div className="flex flex-col lg:flex-row lg:items-end gap-3">
-        <div className="flex items-center gap-2">
-          <button onClick={() => setWeekStart(addDays(weekStart, -7))} className="rounded-lg border border-slate-300 bg-white p-2 hover:bg-slate-50" aria-label="Previous week"><ChevronLeft className="h-4 w-4" /></button>
-          <div className="min-w-[230px] rounded-lg border border-slate-200 bg-white px-4 py-2 text-center">
-            <p className="text-sm font-bold text-slate-800">{dayShort(weekStart)} – {fmtDate(weekEnd)}</p>
-            <p className="text-[11px] text-slate-400">Saturday to Friday{isThisWeek ? ' · this week' : ''}</p>
-          </div>
-          <button onClick={() => setWeekStart(addDays(weekStart, 7))} className="rounded-lg border border-slate-300 bg-white p-2 hover:bg-slate-50" aria-label="Next week"><ChevronRight className="h-4 w-4" /></button>
-          {!isThisWeek && <button onClick={() => setWeekStart(weekStartOf(todayStr()))} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50">This week</button>}
-        </div>
-        <div className="grid grid-cols-2 lg:flex lg:flex-1 gap-2 lg:justify-end">
-          <div><label className={labelCls}>Month</label>
-            <select value={selMonth} onChange={e => { const w = weeksStartingIn(e.target.value); if (w.length) setWeekStart(w[0]); }} className={inputCls}>
-              {monthChoices.map(m => <option key={m} value={m}>{monthName(m)}</option>)}
-            </select></div>
-          <div><label className={labelCls}>Week</label>
-            <select value={weekStart} onChange={e => setWeekStart(e.target.value)} className={inputCls}>
-              {weekChoices.map((w, i) => <option key={w} value={w}>{`Week ${i + 1} · ${dayShort(w)} – ${dayShort(addDays(w, 6))}`}</option>)}
-            </select></div>
-          <div><label className={labelCls}>Jump to date</label><input type="date" value="" onChange={e => e.target.value && setWeekStart(weekStartOf(e.target.value))} className={inputCls} /></div>
-          <div><label className={labelCls}>Driver</label>
-            <select value={driverF} onChange={e => setDriverF(e.target.value)} className={inputCls}><option value="all">All drivers</option>{drivers.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}</select></div>
-          <div><label className={labelCls}>Truck</label>
-            <select value={truckF} onChange={e => setTruckF(e.target.value)} className={inputCls}><option value="all">All trucks</option>{vehicles.map(v => <option key={v.id} value={v.id}>{v.plate_number}</option>)}</select></div>
-          <label className="flex items-end gap-2 pb-2 text-xs font-semibold text-slate-600"><input type="checkbox" checked={onlyPaid} onChange={e => setOnlyPaid(e.target.checked)} /> Only drivers with allowances</label>
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-        <div className="card p-4"><p className="text-xs font-semibold text-slate-500">Week total</p><p className="text-2xl font-bold text-slate-800">{kesFull(weekTotal)}</p></div>
-        <div className="card p-4"><p className="text-xs font-semibold text-slate-500">Drivers paid</p><p className="text-2xl font-bold text-slate-800">{driversPaid}</p></div>
-        <div className="card p-4"><p className="text-xs font-semibold text-slate-500">Entries</p><p className="text-2xl font-bold text-slate-800">{visible.length}</p></div>
-      </div>
-
-      {loading ? <LoadingSpinner message="Loading allowances..." /> : (
-        <>
-          {/* Weekly grid */}
-          <div className="card table-wrapper overflow-x-auto">
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>Driver</th>
-                  {days.map(d => (
-                    <th key={d} className={`text-center ${d === today ? 'text-blue-700' : ''}`}>
-                      <div>{dayName(d)}</div><div className="text-[10px] font-normal text-slate-400">{dayShort(d)}</div>
-                    </th>
-                  ))}
-                  <th className="text-right">Week total</th>
-                </tr>
-              </thead>
-              <tbody>
-                {gridDrivers.length === 0 ? (
-                  <tr><td colSpan={9} className="py-6 text-center text-sm text-slate-400">No drivers to show. Add drivers first, or untick the filter.</td></tr>
-                ) : gridDrivers.map(d => (
-                  <tr key={d.id}>
-                    <td className="font-medium whitespace-nowrap">{d.name}</td>
-                    {days.map(day => {
-                      const v = grid[d.id]?.[day] || 0;
-                      return (
-                        <td key={day} className={`text-center ${day === today ? 'bg-blue-50/50' : ''}`}>
-                          <button onClick={() => openAdd(day, d.id)} title="Add an allowance for this day"
-                            className={`w-full rounded px-2 py-1 text-sm hover:bg-slate-100 ${v ? 'font-semibold text-slate-800' : 'text-slate-300'}`}>{kes(v)}</button>
-                        </td>
-                      );
-                    })}
-                    <td className="text-right font-bold text-slate-800">{kes(driverTotal(d.id))}</td>
-                  </tr>
-                ))}
-                <tr className="bg-slate-50 font-bold">
-                  <td>Daily total</td>
-                  {days.map(day => <td key={day} className="text-center">{kes(dayTotal(day))}</td>)}
-                  <td className="text-right">{kesFull(weekTotal)}</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-
-          {/* Entries */}
-          {visible.length === 0 ? (
-            <div className="card"><EmptyState icon={<Wallet className="h-8 w-8" />} title="No allowances this week" message="Allowances appear here automatically for trips with a driver once an allowance rate is set. You can also add one by hand or click a day in the grid." /></div>
-          ) : (
-            <div className="card table-wrapper overflow-x-auto">
-              <table className="data-table">
-                <thead><tr><th>Date</th><th>Driver</th><th>Truck</th><th>Trip</th><th className="text-right">Allowance</th><th>Entered by</th><th /></tr></thead>
-                <tbody>{visible.map(r => (
-                  <tr key={r.id}>
-                    <td className="whitespace-nowrap">{dayName(r.allowance_date)} {fmtDate(r.allowance_date)}</td>
-                    <td className="font-medium">{dName[r.driver_id] || '—'}</td>
-                    <td>{vName[r.vehicle_id] || '—'}</td>
-                    <td className="max-w-[260px] truncate" title={r.trip_ref || ''}>{r.trip_ref || '—'}</td>
-                    <td className="text-right font-bold text-slate-800">{kesFull(Number(r.amount))}</td>
-                    <td className="text-xs text-slate-500">{r.entered_by || '—'}</td>
-                    <td className="whitespace-nowrap">
-                      <button onClick={() => openEdit(r)} className="mr-2 text-slate-400 hover:text-slate-700" aria-label="Edit"><Pencil className="h-4 w-4" /></button>
-                      <button onClick={() => remove(r.id)} className="text-slate-400 hover:text-red-600" aria-label="Delete"><Trash2 className="h-4 w-4" /></button>
-                    </td>
-                  </tr>))}</tbody>
-              </table>
-            </div>
-          )}
-        </>
-      )}
-
-      {open && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-          <div className="absolute inset-0 bg-black/40" onClick={() => setOpen(false)} />
-          <div className="relative z-10 w-full max-w-lg rounded-2xl bg-white p-5 shadow-2xl space-y-3 max-h-[90vh] overflow-y-auto">
-            <div className="flex items-center justify-between"><h3 className="text-base font-bold text-slate-800">{editId ? 'Edit allowance' : 'Add allowance'}</h3><button onClick={() => setOpen(false)}><X className="h-5 w-5 text-slate-400" /></button></div>
-            <div className="grid grid-cols-2 gap-3">
-              <div className="col-span-2"><label className={labelCls}>Trip this week (optional, fills driver, truck, date and amount)</label>
-                <select value={form.trip_id} onChange={e => pickTrip(e.target.value)} className={inputCls}>
-                  <option value="">— Not linked to a recorded trip —</option>
-                  {trips.map(t => <option key={t.id} value={t.id}>{tripLabel(t)}{Number(t.mileage_payment) > 0 ? ` · KES ${Number(t.mileage_payment).toLocaleString('en-KE')}` : ''}</option>)}
-                </select></div>
-              <div><label className={labelCls}>Date *</label><input type="date" value={form.allowance_date} onChange={e => setForm({ ...form, allowance_date: e.target.value })} className={inputCls} /></div>
-              <div><label className={labelCls}>Allowance (KES) *</label><input type="number" min="0" value={form.amount} onChange={e => setForm({ ...form, amount: e.target.value })} className={inputCls} /></div>
-              <div><label className={labelCls}>Driver *</label><select value={form.driver_id} onChange={e => setForm({ ...form, driver_id: e.target.value })} className={inputCls}><option value="">—</option>{drivers.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}</select></div>
-              <div><label className={labelCls}>Truck</label><select value={form.vehicle_id} onChange={e => setForm({ ...form, vehicle_id: e.target.value })} className={inputCls}><option value="">—</option>{vehicles.map(v => <option key={v.id} value={v.id}>{v.plate_number}</option>)}</select></div>
-              <div className="col-span-2"><label className={labelCls}>Trip reference</label><input value={form.trip_ref} onChange={e => setForm({ ...form, trip_ref: e.target.value })} placeholder="e.g. Mombasa → Nairobi" className={inputCls} /></div>
-              <div className="col-span-2"><label className={labelCls}>Notes</label><input value={form.notes} onChange={e => setForm({ ...form, notes: e.target.value })} className={inputCls} /></div>
-            </div>
-            <p className="text-xs text-slate-400">Counts in the week of {form.allowance_date ? `${dayShort(weekStartOf(form.allowance_date))} – ${dayShort(addDays(weekStartOf(form.allowance_date), 6))}` : '—'} (Saturday to Friday).</p>
-            <div className="flex justify-end gap-2 pt-1">
-              <button onClick={() => setOpen(false)} className="rounded-lg border border-slate-300 px-4 py-2 text-sm">Cancel</button>
-              <button onClick={save} disabled={saving} className="rounded-lg px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" style={{ background: portalColor }}>{saving ? 'Saving...' : 'Save'}</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {ratesOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-          <div className="absolute inset-0 bg-black/40" onClick={() => setRatesOpen(false)} />
-          <div className={`relative z-10 w-full ${byProduct ? 'max-w-3xl' : 'max-w-xl'} rounded-2xl bg-white p-5 shadow-2xl space-y-4 max-h-[90vh] overflow-y-auto`}>
-            <div className="flex items-center justify-between"><h3 className="text-base font-bold text-slate-800">Allowance rates</h3><button onClick={() => setRatesOpen(false)}><X className="h-5 w-5 text-slate-400" /></button></div>
-            <p className="text-xs text-slate-500">Set it once. Every trip with a driver gets its allowance automatically. Change a rate any time: new trips use it straight away, and you can choose to recalculate the week on screen.</p>
-            <div>
-              <label className={labelCls}>{byProduct ? 'Allowance per trip for any other product (KES)' : 'Allowance per trip (KES) *'}</label>
-              <input type="number" min="0" value={defaultDraft} onChange={e => setDefaultDraft(e.target.value)} placeholder="e.g. 1500" className={inputCls} />
-            </div>
-            <div className="space-y-2">
-              <div className="flex items-center justify-between">
-                <label className={labelCls + ' mb-0'}>{byProduct ? 'Allowance per product (and route, if needed)' : 'Allowance per route'}</label>
-                <button onClick={() => setRouteDraft(d => [...d, { key: String(Date.now() + Math.random()), product: '', from_place: '', to_place: '', amount: '' }])}
-                  className="text-xs font-semibold text-blue-600 hover:underline">{byProduct ? '+ Add product' : '+ Add route'}</button>
-              </div>
-              <datalist id="allowance-products">{productSuggestions.map(p => <option key={p} value={p} />)}</datalist>
-              <datalist id="allowance-places">{placeSuggestions.map(p => <option key={p} value={p} />)}</datalist>
-              {routeDraft.length === 0 && <p className="text-xs text-slate-400">{byProduct ? 'No product rates yet. Add each product with its allowance.' : 'No route rates yet. Add each route with its allowance.'}</p>}
-              {routeDraft.map(r => (
-                <div key={r.key} className={`grid ${byProduct ? 'grid-cols-[1.2fr_1fr_1fr_6rem_auto]' : 'grid-cols-[1fr_1fr_6rem_auto]'} gap-2 items-center`}>
-                  {byProduct && <input list="allowance-products" value={r.product} placeholder="Product" className={inputCls}
-                    onChange={e => setRouteDraft(d => d.map(x => x.key === r.key ? { ...x, product: e.target.value } : x))} />}
-                  <input list="allowance-places" value={r.from_place} placeholder={byProduct ? "From (optional)" : "From"} className={inputCls}
-                    onChange={e => setRouteDraft(d => d.map(x => x.key === r.key ? { ...x, from_place: e.target.value } : x))} />
-                  <input list="allowance-places" value={r.to_place} placeholder={byProduct ? "To (optional)" : "To"} className={inputCls}
-                    onChange={e => setRouteDraft(d => d.map(x => x.key === r.key ? { ...x, to_place: e.target.value } : x))} />
-                  <input type="number" min="0" value={r.amount} placeholder="KES" className={inputCls}
-                    onChange={e => setRouteDraft(d => d.map(x => x.key === r.key ? { ...x, amount: e.target.value } : x))} />
-                  <button onClick={() => setRouteDraft(d => d.filter(x => x.key !== r.key))} className="text-slate-400 hover:text-red-600" aria-label="Remove route rate"><Trash2 className="h-4 w-4" /></button>
-                </div>
-              ))}
-              <p className="text-[11px] text-slate-400">{byProduct ? 'Product names must match the trip\'s Product. Add From / To only if the same product pays differently on a route. The most specific rate wins, then the amount above. Capital letters do not matter.' : 'Place names must match the trip\'s From / To (capital letters do not matter). The most specific rate wins.'}</p>
-            </div>
-            <div className="flex justify-end gap-2 pt-1">
-              <button onClick={() => setRatesOpen(false)} className="rounded-lg border border-slate-300 px-4 py-2 text-sm">Cancel</button>
-              <button onClick={saveRates} disabled={savingRates} className="rounded-lg px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" style={{ background: portalColor }}>{savingRates ? 'Saving...' : 'Save rates'}</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      <BulkImportModal
-        open={isBulkOpen}
-        onClose={() => setIsBulkOpen(false)}
-        tableName="driver_allowances"
-        portalColor={portalColor}
-        subAccount={subAccount}
-        sampleColumns={ALLOWANCE_COLUMNS}
-        sampleRow={[new Date().toISOString().slice(0, 10), '1500', 'DRIVER NAME', 'KDG 123A', 'MICD → CSL', '']}
-        transformRecord={rec => {
-          const r = resolveNamesToIds(rec, vehicles, drivers);
-          // Same checks as the Add Allowance form
-          if (!r.driver_id) throw new Error('Driver is required');
-          if (!r.allowance_date) throw new Error('Date is required');
-          if (!(Number(r.amount) > 0)) throw new Error('Allowance amount is required');
-          r.entered_by = who;
-          return r;
-        }}
-        onSuccess={load}
-      />
-    </div>
-  );
+export function downloadTemplate(pageName: TemplateName): void {
+  const headers = HEADERS[pageName];
+  if (!headers) return;
+  const today = new Date().toISOString().split('T')[0];
+  downloadXlsx(`${pageName}_template_${today}.xlsx`, headers);
 }
