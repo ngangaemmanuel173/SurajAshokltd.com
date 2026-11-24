@@ -23,6 +23,16 @@ const weekStartOf = (s: string) => addDays(s, -((parseStr(s).getDay() + 1) % 7))
 const fmtDate = (s?: string | null) => (s ? parseStr(s).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) : '—');
 const dayName = (s: string) => parseStr(s).toLocaleDateString('en-GB', { weekday: 'short' });
 const dayShort = (s: string) => parseStr(s).toLocaleDateString('en-GB', { day: '2-digit', month: 'short' });
+const monthOf = (s: string) => s.slice(0, 7);
+const monthName = (ym: string) => { const [y, m] = ym.split('-').map(Number); return new Date(y, m - 1, 1).toLocaleString('en-GB', { month: 'long', year: 'numeric' }); };
+/** Allowance weeks (Sat → Fri) that START inside the given "YYYY-MM" month */
+const weeksStartingIn = (ym: string) => {
+  const out: string[] = [];
+  let d = `${ym}-01`;
+  while (weekStartOf(d) !== d) d = addDays(d, 1);          // first Saturday of the month
+  for (; monthOf(d) === ym; d = addDays(d, 7)) out.push(d);
+  return out;
+};
 const kes = (n: number) => (n ? n.toLocaleString('en-KE', { maximumFractionDigits: 0 }) : '—');
 const kesFull = (n: number) => `KES ${Number(n || 0).toLocaleString('en-KE', { maximumFractionDigits: 0 })}`;
 
@@ -42,6 +52,15 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
 
   const [weekStart, setWeekStart] = useState(() => weekStartOf(todayStr()));
   const days = useMemo(() => Array.from({ length: 7 }, (_, i) => addDays(weekStart, i)), [weekStart]);
+  const selMonth = monthOf(weekStart);
+  const monthChoices = useMemo(() => {
+    const now = new Date();
+    const list: string[] = [];
+    for (let i = 0; i < 18; i++) { const d = new Date(now.getFullYear(), now.getMonth() - i, 1); list.push(`${d.getFullYear()}-${pad(d.getMonth() + 1)}`); }
+    if (!list.includes(selMonth)) list.push(selMonth);
+    return list.sort().reverse();
+  }, [selMonth]);
+  const weekChoices = useMemo(() => weeksStartingIn(selMonth), [selMonth]);
   const weekEnd = days[6];
 
   const [loading, setLoading] = useState(true);
@@ -236,6 +255,14 @@ export function DriverAllowancesPage({ portalColor, subAccount }: { portalColor:
           {!isThisWeek && <button onClick={() => setWeekStart(weekStartOf(todayStr()))} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50">This week</button>}
         </div>
         <div className="grid grid-cols-2 lg:flex lg:flex-1 gap-2 lg:justify-end">
+          <div><label className={labelCls}>Month</label>
+            <select value={selMonth} onChange={e => { const w = weeksStartingIn(e.target.value); if (w.length) setWeekStart(w[0]); }} className={inputCls}>
+              {monthChoices.map(m => <option key={m} value={m}>{monthName(m)}</option>)}
+            </select></div>
+          <div><label className={labelCls}>Week</label>
+            <select value={weekStart} onChange={e => setWeekStart(e.target.value)} className={inputCls}>
+              {weekChoices.map((w, i) => <option key={w} value={w}>{`Week ${i + 1} · ${dayShort(w)} – ${dayShort(addDays(w, 6))}`}</option>)}
+            </select></div>
           <div><label className={labelCls}>Jump to date</label><input type="date" value="" onChange={e => e.target.value && setWeekStart(weekStartOf(e.target.value))} className={inputCls} /></div>
           <div><label className={labelCls}>Driver</label>
             <select value={driverF} onChange={e => setDriverF(e.target.value)} className={inputCls}><option value="all">All drivers</option>{drivers.map(d => <option key={d.id} value={d.id}>{d.name}</option>)}</select></div>
