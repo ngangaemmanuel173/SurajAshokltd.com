@@ -53,7 +53,7 @@ export function MclTrips({ portalColor }: { portalColor: string }) {
   const [vehicleId, setVehicleId] = useState('');
   const [month, setMonth] = useState(currentMonth());
   const [driverFilter, setDriverFilter] = useState('');
-  const [week, setWeek] = useState('all'); // 'all' | Monday of the chosen week
+  const [week, setWeek] = useState('all'); // 'all' | Saturday of the chosen week
   const [lines, setLines] = useState<Line[]>([]);
   const [ratesOpen, setRatesOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
