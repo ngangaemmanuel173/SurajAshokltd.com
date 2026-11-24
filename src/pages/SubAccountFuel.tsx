@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback, useMemo } from 'react';
+import { usePeriodFilter, PeriodBar } from '@/components/PeriodFilter';
 import {
   Fuel as FuelIcon, Plus, Edit, Filter, ChevronDown, ChevronUp,
   TrendingUp, AlertTriangle, DollarSign, Truck as TruckIcon, Upload,
@@ -112,6 +113,8 @@ export function SubAccountFuel({ mclArea, portalColor }: { mclArea: MCLArea | nu
   const [filterDateFrom, setFilterDateFrom] = useState('');
   const [filterDateTo, setFilterDateTo] = useState('');
   const [overuseOnly, setOveruseOnly] = useState(false);
+  const fuelDates = useMemo(() => records.map(r => r.refuel_date), [records]);
+  const period = usePeriodFilter(fuelDates);
   const [weeklyOpen, setWeeklyOpen] = useState(true);
 
   const emptyForm = {
@@ -162,13 +165,14 @@ export function SubAccountFuel({ mclArea, portalColor }: { mclArea: MCLArea | nu
       if (filterDriver && r.driver_id !== filterDriver) return false;
       if (filterDateFrom && r.refuel_date < filterDateFrom) return false;
       if (filterDateTo && r.refuel_date > filterDateTo) return false;
+      if (!period.okDate(r.refuel_date)) return false;
       if (overuseOnly) {
         if (r.actual_litres == null || r.expected_litres == null || r.expected_litres === 0) return false;
         if (r.actual_litres <= r.expected_litres * 1.0) return false;
       }
       return true;
     });
-  }, [areaFiltered, filterTruck, filterDriver, filterDateFrom, filterDateTo, overuseOnly]);
+  }, [areaFiltered, filterTruck, filterDriver, filterDateFrom, filterDateTo, overuseOnly, period.month, period.week]);
 
   const summary = useMemo(() => {
     const now = new Date();
@@ -317,6 +321,7 @@ export function SubAccountFuel({ mclArea, portalColor }: { mclArea: MCLArea | nu
           <span className="text-slate-400 text-sm">to</span>
           <input type="date" className="input text-sm py-1.5" value={filterDateTo} onChange={e => setFilterDateTo(e.target.value)} />
         </div>
+        <PeriodBar f={period} />
         <label className="flex items-center gap-2 text-sm text-slate-600 cursor-pointer whitespace-nowrap">
           <input type="checkbox" checked={overuseOnly} onChange={e => setOveruseOnly(e.target.checked)} className="h-4 w-4 rounded border-slate-300" style={{ accentColor: portalColor }} />
           Overuse Only
