@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback, useMemo } from 'react';
+import { WeekSelect, inWeek } from '@/components/PeriodFilter';
 import { Fuel as FuelIcon, Save, Settings2, Trash2, Plus, Download, Upload } from 'lucide-react';
 import { supabase } from '@/lib/supabase';
 import { PageHeader } from '@/components/PageHeader';
@@ -25,6 +26,7 @@ export function MclFuel({ portalColor }: { portalColor: string }) {
   const [prices, setPrices] = useState<McFuelPrice[]>([]);
   const [vehicleId, setVehicleId] = useState('');
   const [month, setMonth] = useState(currentMonth());
+  const [week, setWeek] = useState('all'); // 'all' | Monday of the chosen week (rows only; balances and totals stay for the whole month)
   const [rows, setRows] = useState<Record<string, Row>>({});
   const [tripDays, setTripDays] = useState<Record<string, { trips: number; planned: number }>>({});
   const [opening, setOpening] = useState('');
@@ -199,7 +201,11 @@ export function MclFuel({ portalColor }: { portalColor: string }) {
         </div>
         <div>
           <label className="label">Month</label>
-          <input type="month" className="input" value={month} onChange={e => e.target.value && guard(() => setMonth(e.target.value))} />
+          <input type="month" className="input" value={month} onChange={e => e.target.value && guard(() => { setMonth(e.target.value); setWeek('all'); })} />
+        </div>
+        <div>
+          <label className="label">Week</label>
+          <WeekSelect month={month} value={week} onChange={setWeek} />
         </div>
         <div>
           <label className="label">Opening balance (L)</label>
@@ -266,7 +272,7 @@ export function MclFuel({ portalColor }: { portalColor: string }) {
                 </tr>
               </thead>
               <tbody>
-                {computed.rows.map(c => {
+                {computed.rows.filter(c => inWeek(c.date, week)).map(c => {
                   const r = rows[c.date] ?? emptyRow();
                   const cell = (key: 'f1' | 'f2' | 'f3' | 'bal', w = 'w-20') => (
                     <input
@@ -297,7 +303,7 @@ export function MclFuel({ portalColor }: { portalColor: string }) {
               </tbody>
               <tfoot>
                 <tr className="font-bold bg-slate-50">
-                  <td className="sticky left-0 bg-slate-50">Total</td>
+                  <td className="sticky left-0 bg-slate-50">Month total</td>
                   <td className="text-right">{t.trips}</td>
                   <td className="text-right">{fmt(t.planned, 1)}</td>
                   <td colSpan={3} />
