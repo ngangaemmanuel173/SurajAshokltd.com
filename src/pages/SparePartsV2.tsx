@@ -1,4 +1,5 @@
 import { useTruckDriverFilter, TruckDriverBar } from '@/components/TruckDriverFilter';
+import { downloadXlsx } from '@/lib/spreadsheet';
 import { useEffect, useState, useCallback, useMemo } from 'react';
 import {
   Wrench, Plus, Edit, Search, History, Package, Battery, Upload, Download, X, FileText, RefreshCw,
@@ -488,15 +489,7 @@ function SparePartsSubAccountView({ mclArea, portalColor, forceSubAccount }: { m
   /* --------------------------- Template --------------------------- */
 
   const downloadTemplate = () => {
-    const header = SAMPLE_COLUMNS.join(',');
-    const example = SAMPLE_ROW.join(',');
-    const blob = new Blob([`${header}\n${example}\n`], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'spare_parts_template.csv';
-    a.click();
-    URL.revokeObjectURL(url);
+    downloadXlsx('spare_parts_template.xlsx', SAMPLE_COLUMNS, SAMPLE_ROW);
   };
 
   /* ------------------------ Add / Edit part ----------------------- */
