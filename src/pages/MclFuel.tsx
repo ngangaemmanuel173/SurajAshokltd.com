@@ -26,7 +26,7 @@ export function MclFuel({ portalColor }: { portalColor: string }) {
   const [prices, setPrices] = useState<McFuelPrice[]>([]);
   const [vehicleId, setVehicleId] = useState('');
   const [month, setMonth] = useState(currentMonth());
-  const [week, setWeek] = useState('all'); // 'all' | Monday of the chosen week (rows only; balances and totals stay for the whole month)
+  const [week, setWeek] = useState('all'); // 'all' | Saturday of the chosen week (rows only; balances and totals stay for the whole month)
   const [rows, setRows] = useState<Record<string, Row>>({});
   const [tripDays, setTripDays] = useState<Record<string, { trips: number; planned: number }>>({});
   const [opening, setOpening] = useState('');
