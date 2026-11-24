@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
+import { WeekSelect, inWeek } from '@/components/PeriodFilter';
 import { Route as RouteIcon, Save, Settings2, Trash2, Plus, Download, Upload, Undo2 } from 'lucide-react';
 import { supabase } from '@/lib/supabase';
 import { PageHeader } from '@/components/PageHeader';
@@ -52,6 +53,7 @@ export function MclTrips({ portalColor }: { portalColor: string }) {
   const [vehicleId, setVehicleId] = useState('');
   const [month, setMonth] = useState(currentMonth());
   const [driverFilter, setDriverFilter] = useState('');
+  const [week, setWeek] = useState('all'); // 'all' | Monday of the chosen week
   const [lines, setLines] = useState<Line[]>([]);
   const [ratesOpen, setRatesOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
@@ -229,8 +231,8 @@ export function MclTrips({ portalColor }: { portalColor: string }) {
     dayTotals({ weights: { 1: num(l.kg) }, sources: { 1: l.src || 'M' } }, l.date, rates, override), [rates, override]);
 
   const visible = useMemo(
-    () => lines.filter(l => !l.removed && (!driverFilter || l.driver_id === driverFilter)),
-    [lines, driverFilter],
+    () => lines.filter(l => !l.removed && (!driverFilter || l.driver_id === driverFilter) && inWeek(l.date, week)),
+    [lines, driverFilter, week],
   );
 
   const summary = useMemo(() => {
@@ -298,7 +300,11 @@ export function MclTrips({ portalColor }: { portalColor: string }) {
         </div>
         <div>
           <label className="label">Month</label>
-          <input type="month" className="input" value={month} onChange={e => e.target.value && guard(() => setMonth(e.target.value))} />
+          <input type="month" className="input" value={month} onChange={e => e.target.value && guard(() => { setMonth(e.target.value); setWeek('all'); })} />
+        </div>
+        <div>
+          <label className="label">Week</label>
+          <WeekSelect month={month} value={week} onChange={setWeek} />
         </div>
         <div>
           <label className="label">Driver</label>
@@ -390,7 +396,7 @@ export function MclTrips({ portalColor }: { portalColor: string }) {
                 </tr>
               </thead>
               <tbody>
-                {days.map(date => {
+                {days.filter(d => inWeek(d, week)).map(date => {
                   const dayLines = byDate.get(date) || [];
                   const live = dayLines.filter(l => !l.removed);
                   if (dayLines.length === 0) {
@@ -481,7 +487,7 @@ export function MclTrips({ portalColor }: { portalColor: string }) {
               </tbody>
               <tfoot>
                 <tr className="font-bold bg-slate-50">
-                  <td className="sticky left-0 bg-slate-50">{truck} total{driverFilter ? ` · ${driverName(driverFilter)}` : ''}</td>
+                  <td className="sticky left-0 bg-slate-50">{truck} {week === 'all' ? 'month' : 'week'} total{driverFilter ? ` · ${driverName(driverFilter)}` : ''}</td>
                   <td colSpan={5} className="text-blue-700">{summary.trips} trip{summary.trips === 1 ? '' : 's'}</td>
                   <td className="text-right text-emerald-700">{fmt(summary.tons, 2)}</td>
                   <td className="text-right">{fmt(summary.revenue)}</td>
