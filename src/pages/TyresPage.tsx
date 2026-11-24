@@ -1,4 +1,5 @@
 import { useTruckDriverFilter, TruckDriverBar } from '@/components/TruckDriverFilter';
+import { downloadXlsx } from '@/lib/spreadsheet';
 import { useEffect, useState, useCallback, useMemo } from 'react';
 import { CircleDot, Plus, Edit, Search, History, Upload, Download, X, RefreshCw } from 'lucide-react';
 import { supabase, getSubAccountFilter, setSubAccountFilter } from '@/lib/supabase';
@@ -447,14 +448,7 @@ function TyresSubAccountView({ mclArea, portalColor, forceSubAccount }: { mclAre
   const sampleRow = SAMPLE_COLUMNS.map(c => (c === 'sub_account' ? (subAccount as string) : String(TYRE_TEMPLATE_EXAMPLE[c] ?? '')));
 
   const downloadTemplate = () => {
-    const example = sampleRow.join(',');
-    const blob = new Blob([`${SAMPLE_COLUMNS.join(',')}\n${example}\n`], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'tyres_template.csv';
-    a.click();
-    URL.revokeObjectURL(url);
+    downloadXlsx('tyres_template.xlsx', SAMPLE_COLUMNS, sampleRow);
   };
 
   /* ------------------------ Add / Edit tyre ----------------------- */
