@@ -4,7 +4,7 @@ import { useMemo, useState } from 'react';
  * Shared Month + Week filter used on every trip-related list (Trips, Tallies, Fuel, Allowances).
  *
  * - Month options come from the dates actually present in the data (newest first), plus the current month.
- * - Week options belong to the chosen month (Monday → Sunday, clipped to the month). With "All months"
+ * - Week options belong to the chosen month (Saturday → Friday, clipped to the month). With "All months"
  *   the weeks that appear in the data are listed instead (most recent first).
  * - Dates are compared as "YYYY-MM-DD" strings, so there are no time-zone surprises.
  */
@@ -13,8 +13,8 @@ const pad = (n: number) => String(n).padStart(2, '0');
 const toStr = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 const parseStr = (s: string) => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
 const addDays = (s: string, n: number) => { const d = parseStr(s); d.setDate(d.getDate() + n); return toStr(d); };
-/** Monday of the week the date falls in */
-const weekStartOf = (s: string) => addDays(s, -((parseStr(s).getDay() + 6) % 7));
+/** Saturday of the week the date falls in (weeks run Saturday → Friday). JS getDay(): Sun=0 … Sat=6 */
+const weekStartOf = (s: string) => addDays(s, -((parseStr(s).getDay() + 1) % 7));
 const monthEnd = (ym: string) => { const [y, m] = ym.split('-').map(Number); return toStr(new Date(y, m, 0)); };
 const dayOnly = (v: unknown): string => (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}/.test(v) ? v.slice(0, 10) : '');
 
@@ -28,7 +28,7 @@ export interface PeriodOption { value: string; label: string }
 
 export function usePeriodFilter(dates: unknown[]) {
   const [month, setMonthState] = useState('all');   // 'all' | 'YYYY-MM'
-  const [week, setWeek] = useState('all');          // 'all' | Monday 'YYYY-MM-DD'
+  const [week, setWeek] = useState('all');          // 'all' | Saturday 'YYYY-MM-DD'
 
   const days = useMemo(() => {
     const set = new Set<string>();
@@ -106,7 +106,7 @@ export function PeriodBar({ f }: { f: PeriodFilterState }) {
 
 /* ---------- week-only helpers for pages that already have their own month picker (MCL sheets, Allowances) ---------- */
 
-/** Weeks (Monday → Sunday, clipped to the month) that overlap a "YYYY-MM" month */
+/** Weeks (Saturday → Friday, clipped to the month) that overlap a "YYYY-MM" month */
 export function weekOptionsForMonth(ym: string): PeriodOption[] {
   const first = `${ym}-01`, last = monthEnd(ym);
   const out: PeriodOption[] = [];
@@ -120,7 +120,7 @@ export function weekOptionsForMonth(ym: string): PeriodOption[] {
   return out;
 }
 
-/** true when `date` is inside the Monday-start week `weekStart` (or no week is chosen) */
+/** true when `date` is inside the Saturday-start week `weekStart` (or no week is chosen) */
 export const inWeek = (date: string, weekStart: string) => weekStart === 'all' || (date >= weekStart && date <= addDays(weekStart, 6));
 
 export function WeekSelect({ month, value, onChange, className }: { month: string; value: string; onChange: (v: string) => void; className?: string }) {
