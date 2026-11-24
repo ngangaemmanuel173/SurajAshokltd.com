@@ -1,3 +1,4 @@
+import { downloadXlsx } from '@/lib/spreadsheet';
 import { TYRE_TEMPLATE_COLUMNS } from '@/lib/tyreTemplate';
 import {
   CSL_TRIP_COLUMNS, LONG_TRIP_COLUMNS, TARMAL_TRIP_COLUMNS, FUEL_COLUMNS, TALLY_COLUMNS, CONTAINER_COLUMNS,
@@ -124,12 +125,5 @@ export function downloadTemplate(pageName: TemplateName): void {
   const headers = HEADERS[pageName];
   if (!headers) return;
   const today = new Date().toISOString().split('T')[0];
-  const csv = headers.join(',') + '\n';
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.download = `${pageName}_template_${today}.csv`;
-  link.click();
-  URL.revokeObjectURL(url);
+  downloadXlsx(`${pageName}_template_${today}.xlsx`, headers);
 }
