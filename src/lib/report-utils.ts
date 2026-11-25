@@ -91,13 +91,14 @@ export interface ReportData {
 
 
 /**
- * Reports were written for an old `tyres` table. Tyres now live in `tyres_v2`;
- * this maps a tyres_v2 row to the shape the report pages expect.
+ * Reports were written for an old `tyres` table. Tyres now come from the Tyre Records app (view `tyres_live`);
+ * this maps a tyres_live row to the shape the report pages expect.
  */
 export function normalizeTyre(t: any) {
   return {
     ...t,
     vehicle_id: t.current_truck_id ?? null,
+    vehicle: t.vehicle ?? (t.plate_number ? { plate_number: t.plate_number } : null),
     cost: t.unit_cost,
     total_km: t.total_km ?? 0,
     status: t.status === 'fitted' ? 'in_use' : t.status === 'disposed' ? 'retired' : t.status,
