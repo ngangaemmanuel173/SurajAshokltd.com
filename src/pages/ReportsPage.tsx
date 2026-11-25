@@ -109,7 +109,7 @@ export function ReportsPage({ mclArea, portalColor }: { mclArea: MCLArea | null;
       setVehicles(r.data || []);
     });
 
-    let tyreQuery = supabase.from('tyres_v2').select('*, vehicle:vehicles!current_truck_id(plate_number)');
+    let tyreQuery = supabase.from('tyres_live').select('*');
     if (subAccount !== 'master') {
       tyreQuery = tyreQuery.eq('sub_account', subAccount);
     }
