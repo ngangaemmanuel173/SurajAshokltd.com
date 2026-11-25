@@ -38,7 +38,7 @@ function periodRange(p: Period): { from: string; to: string } {
 const WATCH_TABLES = [
   'mcl_trips', 'csl_trips', 'tarmal_trips', 'pn_mashru_trips',
   'sub_account_fuel', 'driver_mileage', 'truck_revenue',
-  'spare_parts_v2', 'tyres_v2', 'vehicles', 'drivers',
+  'spare_parts_v2', 'tyre_records', 'vehicles', 'drivers',
 ];
 
 export function Dashboard({
