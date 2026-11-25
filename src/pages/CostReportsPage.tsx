@@ -129,7 +129,7 @@ export function CostReportsPage({ portalColor, lockedSubAccount }: { portalColor
       scope(supabase.from('sub_account_fuel').select('vehicle_id, total_cost, refuel_date, sub_account').gte('refuel_date', start).lte('refuel_date', end)),
       supabase.from('spare_part_history').select('spare_part_id, action, action_date, truck_id').eq('action', 'installed').gte('action_date', start).lte('action_date', end),
       scope(supabase.from('spare_parts_v2').select('id, part_name, serial_number, unit_cost, sub_account, status, current_truck_id, installed_date, last_changed_date, purchase_date, created_at')),
-      scope(supabase.from('tyres_v2').select('id, serial_number, brand, unit_cost, fitted_date, current_truck_id, sub_account').gte('fitted_date', start).lte('fitted_date', end)),
+      scope(supabase.from('tyre_costs_v').select('id, serial_number, brand, unit_cost, fitted_date, current_truck_id, sub_account').gte('fitted_date', start).lte('fitted_date', end)),
       scope(supabase.from('truck_revenue').select('*').gte('period', start).lte('period', end)),
       scope(supabase.from('truck_revenue_entries').select('*').gte('period', start).lte('period', end).order('created_at', { ascending: false })),
       scope(supabase.from('cost_entries').select('*').gte('period', start).lte('period', end).order('period', { ascending: false })),
