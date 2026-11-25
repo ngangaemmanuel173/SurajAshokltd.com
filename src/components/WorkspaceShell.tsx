@@ -300,7 +300,7 @@ export function WorkspaceShell({
                 </>
               )}
             </div>
-            {!isMaster && ['trips', 'vehicles', 'spare-parts', 'tyres'].includes(activeTab) && (
+            {!isMaster && ['trips', 'vehicles', 'spare-parts'].includes(activeTab) && (
               <button
                 onClick={() => setIsUploadOpen(true)}
                 className="flex items-center gap-1.5 text-xs font-medium text-white rounded-lg px-3 py-2 shadow-sm transition-opacity hover:opacity-90"
