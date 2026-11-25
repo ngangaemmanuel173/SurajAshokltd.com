@@ -80,7 +80,7 @@ export async function loadDashboardRaw(
     pagedAll(() => supabase.from('sub_account_fuel').select('vehicle_id, driver_id, total_cost').eq('sub_account', sa).gte('refuel_date', start).lte('refuel_date', end).order('id')),
     pagedAll(() => supabase.from('driver_mileage').select('vehicle_id, driver_id, km_covered').eq('sub_account', sa).gte('entry_date', start).lte('entry_date', end).order('id')),
     pagedAll(() => supabase.from('spare_parts_v2').select('id, unit_cost, status, current_truck_id, installed_date, purchase_date, created_at').eq('sub_account', sa).order('id')),
-    pagedAll(() => supabase.from('tyres_v2').select('id, unit_cost, current_truck_id, fitted_date').eq('sub_account', sa).gte('fitted_date', start).lte('fitted_date', end).order('id')),
+    pagedAll(() => supabase.from('tyre_costs_v').select('id, unit_cost, current_truck_id, fitted_date').eq('sub_account', sa).gte('fitted_date', start).lte('fitted_date', end).order('id')),
   ]);
 
   note('vehicles', (veh as any).error?.message);
