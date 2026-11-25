@@ -27,6 +27,15 @@ const PROTECTED = new Set(['id', 'created_at', 'updated_at', 'trip_date', 'vehic
 const isEmpty = (v: unknown) => v === null || v === undefined || (typeof v === 'string' && v.trim() === '') || v === 0;
 const norm = (v: unknown) => String(v ?? '').trim().toUpperCase().replace(/\s+/g, ' ');
 
+const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/;
+
+/** True for a real calendar day written yyyy-mm-dd (rejects 2026-13-40 and similar). */
+export function isValidIsoDay(iso: string): boolean {
+  if (!ISO_DAY.test(iso)) return false;
+  const d = new Date(iso + 'T00:00:00Z');
+  return !isNaN(d.getTime()) && d.toISOString().slice(0, 10) === iso;
+}
+
 function nextDay(iso: string): string {
   const d = new Date(iso + 'T00:00:00Z');
   d.setUTCDate(d.getUTCDate() + 1);
@@ -40,6 +49,9 @@ export async function planTripMerge(table: string, rec: Record<string, any>, ear
 
   // Without a date and truck there is nothing to match on: it would be saved as a new trip.
   if (!date || !rec.vehicle_id) return { action: 'insert', record: rec };
+  if (!isValidIsoDay(date)) {
+    return { action: 'error', record: rec, message: `trip_date "${rec.trip_date}" is not a valid date (use yyyy-mm-dd, e.g. 2026-11-25)` };
+  }
 
   const found = await supabase.from(table).select('*')
     .eq('vehicle_id', rec.vehicle_id).gte('trip_date', date).lt('trip_date', nextDay(date));
