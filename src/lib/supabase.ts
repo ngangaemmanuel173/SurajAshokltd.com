@@ -44,7 +44,7 @@ export function activeSubAccount(profileSub: string | null | undefined, fallback
   return profileSub ?? f ?? fallback;
 }
 
-const EXCLUDED_TABLES = new Set(['profiles', 'spare_part_history']);
+const EXCLUDED_TABLES = new Set(['profiles', 'spare_part_history', 'tyre_records']);
 
 // Trips tables that are already separate per sub-account. The table itself keeps the
 // data apart, so there is no sub_account column to filter on or to stamp on inserts.
