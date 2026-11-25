@@ -31,12 +31,32 @@ interface BulkImportModalProps {
 
 // Excel saves dates as dd/mm/yyyy, but the database reads that as mm/dd/yyyy and swaps day and month
 // (02/11/2026 becomes 11 February). Convert day-first dates to yyyy-mm-dd before saving.
+const MONTHS: Record<string, number> = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+const p2 = (n: number | string) => String(n).padStart(2, '0');
+
 function normalizeDateValue(header: string, value: string): string {
   const h = header.trim().toLowerCase();
   if (!h.includes('date') && h !== 'eta') return value;
-  const m = value.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{4})$/);
-  if (!m) return value;
-  return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+  const v = value.trim().replace(/[T ]\d{1,2}:\d{2}(:\d{2})?(\.\d+)?Z?$/, ''); // drop a time part
+  let m: RegExpMatchArray | null;
+  // yyyy-mm-dd, yyyy/mm/dd, yyyy.mm.dd
+  if ((m = v.match(/^(\d{4})[\/.\-](\d{1,2})[\/.\-](\d{1,2})$/))) return `${m[1]}-${p2(m[2])}-${p2(m[3])}`;
+  // dd/mm/yyyy or dd/mm/yy (day first)
+  if ((m = v.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2}|\d{4})$/))) {
+    const yr = m[3].length === 2 ? `20${m[3]}` : m[3];
+    return `${yr}-${p2(m[2])}-${p2(m[1])}`;
+  }
+  // 25-Nov-2026, 25 Nov 2026, 25 November 26
+  if ((m = v.match(/^(\d{1,2})[\s\-\/.]([A-Za-z]{3,9})[\s\-\/.,]+(\d{2}|\d{4})$/)) && MONTHS[m[2].slice(0, 3).toLowerCase()]) {
+    const yr = m[3].length === 2 ? `20${m[3]}` : m[3];
+    return `${yr}-${p2(MONTHS[m[2].slice(0, 3).toLowerCase()])}-${p2(m[1])}`;
+  }
+  // Excel serial number that arrived as plain digits (e.g. 46346)
+  if (/^\d{5}$/.test(v)) {
+    const d = new Date(Math.round((Number(v) - 25569) * 86400 * 1000));
+    if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10);
+  }
+  return value;
 }
 
 /** Splits one CSV/TSV line, keeping delimiters that sit inside "quotes" (e.g. a note like "Fitted on KDX 937L, diff"). */
