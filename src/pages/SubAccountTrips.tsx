@@ -10,7 +10,7 @@ import { LoadingSpinner, EmptyState } from '@/components/Shared';
 import { useToast } from '@/components/Toast';
 import { SubAccount, MCLArea } from '@/lib/portals';
 import { BulkImportModal } from '@/components/BulkImportModal';
-import { planTripMerge, applyTripPlan } from '@/lib/mergeImport';
+import { planTripMerge, applyTripPlan, isValidIsoDay } from '@/lib/mergeImport';
 import { CSL_TRIP_COLUMNS, LONG_TRIP_COLUMNS, TARMAL_TRIP_COLUMNS } from '@/lib/importColumns';
 import { resolveNamesToIds } from '@/lib/importLookups';
 
@@ -592,6 +592,9 @@ export function SubAccountTrips({ mclArea, portalColor }: { mclArea: MCLArea | n
         transformRecord={rec => {
           const r = resolveNamesToIds(rec, vehicles, drivers);
           if (isCSL) {
+            if (r.trip_date != null && !isValidIsoDay(String(r.trip_date).slice(0, 10))) {
+              throw new Error(`trip_date "${r.trip_date}" is not a valid date (use yyyy-mm-dd, e.g. 2026-11-25)`);
+            }
             // Same values the Add Trip form saves for blank fields
             for (const k of ['product', 'delivery_no', 'departure_point', 'destination']) if (r[k] == null) r[k] = '';
             r.net_tallage = Number(r.net_tallage) || 0;
