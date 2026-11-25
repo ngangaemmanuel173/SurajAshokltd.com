@@ -82,7 +82,7 @@ export function MasterReportsPage({ portalColor }: { portalColor: string }) {
         supabase.from('driver_compliance_items').select('*, driver:drivers(name)').eq('sub_account', sa).order('expiry_date', { ascending: true, nullsFirst: false }),
         supabase.from('vehicles').select('id, plate_number, make, model').eq('sub_account', sa).order('plate_number'),
         supabase.from('drivers').select('id, name').eq('sub_account', sa).order('name'),
-        supabase.from('tyres_v2').select('*, vehicle:vehicles!current_truck_id(plate_number)').eq('sub_account', sa),
+        supabase.from('tyres_live').select('*').eq('sub_account', sa),
       ]);
 
       results[sa] = {
