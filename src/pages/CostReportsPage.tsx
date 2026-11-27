@@ -299,7 +299,7 @@ export function CostReportsPage({ portalColor, lockedSubAccount }: { portalColor
     toast('Salary saved'); setEf({ ...ef, amount: '', notes: '' }); load();
   };
 
-  /* ---------------- revenue + per-truck costs: x116%, then ADDED to what is already saved ---------------- */
+  /* ---------------- revenue: x116%, then ADDED to what is already saved. Insurance / loans / allowance are saved exactly as typed (also ADDED to what is saved) ---------------- */
   const subOfTruck = (vehicleId: string, fallback: string) => vehSub[vehicleId] || fallback;
 
   const addRevenue = async (sub: string, vehicleId: string, ym: string, amount: number, notes?: string | null) => {
@@ -331,7 +331,7 @@ export function CostReportsPage({ portalColor, lockedSubAccount }: { portalColor
   const addTruckCosts = async (sub: string, vehicleId: string, ym: string, c: { insurance: number; loan: number; driver_allowance: number }) => {
     const { error } = await supabase.rpc('add_truck_costs', {
       p_sub_account: sub, p_vehicle_id: vehicleId, p_period: `${ym}-01`,
-      p_insurance: withVat(c.insurance), p_loan: withVat(c.loan), p_driver_allowance: withVat(c.driver_allowance), p_entered_by: who,
+      p_insurance: c.insurance, p_loan: c.loan, p_driver_allowance: c.driver_allowance, p_entered_by: who, // exactly as typed: no 116% here, only Revenue gets it
     });
     return error;
   };
@@ -377,7 +377,7 @@ export function CostReportsPage({ portalColor, lockedSubAccount }: { portalColor
     // clear only what was saved so a failed row is not lost or double-added
     setGrid(g => { const n = { ...g }; done.forEach(id => delete n[id]); return n; });
     if (failed) toast(`${done.length} truck(s) saved, then an error: ${failed}`, 'error');
-    else toast(`Saved for ${done.length} truck(s) (incl. ${vatPct}% tax, added to the existing figures)`);
+    else toast(`Saved for ${done.length} truck(s) (added to the existing figures)`);
     load(); loadSaved();
   };
 
@@ -620,7 +620,7 @@ export function CostReportsPage({ portalColor, lockedSubAccount }: { portalColor
                   <button onClick={saveTruckCosts} disabled={saving} className="flex items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-semibold text-white disabled:opacity-50" style={{ background: portalColor }}>
                     <Plus className="h-4 w-4" /> {saving ? 'Saving...' : 'Save all'}
                   </button>
-                  <p className="text-xs text-slate-500 flex-1 min-w-[16rem]">Type the figures under each truck. Every amount is multiplied by {Math.round(VAT_MULTIPLIER * 100)}% (tax inclusive) and added to what is already saved for that truck in {monthLabel(`${ef.month}-01`)}. Leave a box empty to skip it.</p>
+                  <p className="text-xs text-slate-500 flex-1 min-w-[16rem]">Type the figures under each truck. Amounts are saved exactly as typed and added to what is already saved for that truck in {monthLabel(`${ef.month}-01`)}. Leave a box empty to skip it.</p>
                 </div>
                 <div className="table-wrapper overflow-x-auto">
                   <table className="data-table">
