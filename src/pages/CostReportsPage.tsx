@@ -1,3 +1,4 @@
+import { spareDate, spareInPeriod } from '@/lib/spareDates';
 import { useTruckDriverFilter, TruckDriverBar } from '@/components/TruckDriverFilter';
 import { useEffect, useState, useCallback, useMemo, Fragment, type ReactNode } from 'react';
 import { FileText, Plus, Trash2, Download, Upload, ChevronDown, ChevronRight, Pencil, Check, X } from 'lucide-react';
@@ -170,21 +171,15 @@ export function CostReportsPage({ portalColor, lockedSubAccount }: { portalColor
   const driverName = useMemo(() => Object.fromEntries(d.drivers.map((x: any) => [x.id, x.name])), [d.drivers]);
   const partMap = useMemo(() => Object.fromEntries(d.parts.map((p: any) => [p.id, p])), [d.parts]);
 
-  // Spares cost = unit cost of every spare, counted in the month it was BOUGHT (purchase date), whatever its status.
+  // Spares cost = unit cost of every spare, counted ONLY in the month it belongs to, whatever its status.
+  // A spare's month is its purchase date, else its installed date, else last changed date, else the day it was added
+  // (same rule as the Spare Parts page filters, see lib/spareDates). Nothing is carried into other months.
   // A spare that is on a truck is charged to that truck; store / office / unassigned spares go to "Unallocated (store/office)".
-  // Spares IN STORE with no purchase date are always included (in whatever period is viewed) so nothing in the store is missed.
-  // Any other spare with no purchase date uses its installed date, then the day it was added to the system.
   const periodStart = `${fromM}-01`, periodEnd = endOfMonth(toM);
   const spareItems = useMemo(() => d.parts
-    .map((p: any) => {
-      const undatedStore = p.status === 'in_store' && !p.purchase_date;
-      const date = p.purchase_date || p.installed_date || (p.created_at ? String(p.created_at).slice(0, 10) : null);
-      return { p, undatedStore, date };
-    })
-    .filter((x: any) => x.undatedStore || (x.date && x.date >= periodStart && x.date <= periodEnd))
-    .map((x: any) => ({ date: x.date || '—', truck: x.p.current_truck_id || null, name: `${x.p.part_name || 'Spare'} ${x.p.serial_number || ''}`.trim() + (x.undatedStore ? ' (store, no purchase date)' : ''), cost: Number(x.p.unit_cost || 0), sub: x.p.sub_account, status: x.p.status, undatedStore: x.undatedStore })),
+    .filter((p: any) => spareInPeriod(p, periodStart, periodEnd))
+    .map((p: any) => ({ date: spareDate(p) || '—', truck: p.current_truck_id || null, name: `${p.part_name || 'Spare'} ${p.serial_number || ''}`.trim(), cost: Number(p.unit_cost || 0), sub: p.sub_account, status: p.status, undatedStore: false })),
   [d.parts, periodStart, periodEnd]);
-  const undatedStoreTotal = useMemo(() => spareItems.filter((i: any) => i.undatedStore).reduce((a: number, i: any) => a + i.cost, 0), [spareItems]);
   // Spares bought in the period that are not on a truck (store, office, repair, retired)
   const sparesNoTruck = useMemo(() => spareItems.filter((i: any) => !i.truck).reduce((a: number, i: any) => a + i.cost, 0), [spareItems]);
   // MCL auto revenue per truck and month: [{ vehicle_id, month, trips, tons, amount }]
@@ -662,8 +657,7 @@ export function CostReportsPage({ portalColor, lockedSubAccount }: { portalColor
 
           {view === 'maintenance' && (
             <div className="space-y-4">
-              <p className="text-sm text-slate-500">Spares, tyres and fuel per truck. Spares are counted in the month they were bought; ones not fitted to a truck show as Unallocated (store/office). Spares in store with no purchase date are always included. Any other spare with no purchase date uses its installed date, or the day it was added.</p>
-              {undatedStoreTotal > 0 && truck === 'all' && <p className="rounded-lg bg-amber-50 p-3 text-sm text-amber-800">{kes(undatedStoreTotal)} of the store spares below have no purchase date, so they appear in every period you view. Add a purchase date to a spare to count it in one month only.</p>}
+              <p className="text-sm text-slate-500">Spares, tyres and fuel per truck. Spares are counted in the month they were bought; ones not fitted to a truck show as Unallocated (store/office). A spare with no purchase date is counted in the month it was installed, or the month it was added.</p>
               <Table head={['Truck', 'Spares', 'Tyres', 'Fuel', 'Total']}>
                 {rows.map((r: any) => <tr key={r.id}><td className="font-bold">{r.plate}</td><Num v={r.spares} /><Num v={r.tyres} /><Num v={r.fuel} /><Num v={r.spares + r.tyres + r.fuel} bold /></tr>)}
                 {truck === 'all' && sparesNoTruck > 0 && <tr><td className="font-bold italic">Unallocated (store/office)</td><Num v={sparesNoTruck} /><Num v={0} /><Num v={0} /><Num v={sparesNoTruck} bold /></tr>}
