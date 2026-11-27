@@ -1,3 +1,4 @@
+import { spareInPeriod } from '@/lib/spareDates';
 import { useTruckDriverFilter, TruckDriverBar, filterReportData, filterTyres } from '@/components/TruckDriverFilter';
 import { useState, useMemo, useEffect, useCallback } from 'react';
 import { FileText, Download, Calendar, CheckCircle, ChevronRight, RotateCw } from 'lucide-react';
@@ -89,7 +90,8 @@ export function MasterReportsPage({ portalColor }: { portalColor: string }) {
         trips: trips.data || [],
         fuel: fuel.data || [],
         tallies: tallies.data || [],
-        spareParts: parts.data || [],
+        // Only the spares that belong to the report period (see spareDate)
+        spareParts: (parts.data || []).filter((p: any) => spareInPeriod(p, from, to)),
         containers: containers.data || [],
         vehicleCompliance: vc.data || [],
         driverCompliance: dc.data || [],
