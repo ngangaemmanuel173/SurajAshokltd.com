@@ -11,6 +11,8 @@ import { LoadingSpinner, EmptyState } from '@/components/Shared';
 import { useToast } from '@/components/Toast';
 import { SubAccount, MCLArea } from '@/lib/portals';
 import { BulkImportModal } from '@/components/BulkImportModal';
+import { usePeriodFilter, PeriodBar } from '@/components/PeriodFilter';
+import { spareDate } from '@/lib/spareDates';
 
 /* ------------------------------------------------------------------ */
 /* Constants                                                           */
@@ -384,6 +386,9 @@ function SparePartsSubAccountView({ mclArea, portalColor, forceSubAccount }: { m
   const [statusFilter, setStatusFilter] = useState('all');
   const [truckFilter, setTruckFilter] = useState('all');
   const tdf = useTruckDriverFilter(subAccount);
+  // Month / week (Saturday → Friday) / day filter. Each spare is filed under spareDate(): purchase → installed → last changed → added.
+  const spareDates = useMemo(() => parts.map(spareDate), [parts]);
+  const period = usePeriodFilter(spareDates);
 
   // Panels / modals
   const [isBulkOpen, setIsBulkOpen] = useState(false);
@@ -457,18 +462,21 @@ function SparePartsSubAccountView({ mclArea, portalColor, forceSubAccount }: { m
 
   const selectedPart = useMemo(() => parts.find(p => p.id === selectedId) || null, [parts, selectedId]);
 
+  // Parts inside the chosen month / week / day (all parts when no period is chosen)
+  const periodParts = useMemo(() => parts.filter(p => period.okDate(spareDate(p))), [parts, period.month, period.week, period.day]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const tabCounts = useMemo(() => {
     const c: Record<string, number> = {};
-    parts.forEach(p => {
+    periodParts.forEach(p => {
       c[`${p.category}`] = (c[`${p.category}`] || 0) + 1;
       c[`${p.category}:${p.part_type}`] = (c[`${p.category}:${p.part_type}`] || 0) + 1;
     });
     return c;
-  }, [parts]);
+  }, [periodParts]);
 
   const visibleParts = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return parts.filter(p => {
+    return periodParts.filter(p => {
       if (p.category !== category || p.part_type !== partType) return false;
       if (statusFilter !== 'all' && p.status !== statusFilter) return false;
       if (truckFilter !== 'all' && p.current_truck_id !== truckFilter) return false;
@@ -479,7 +487,7 @@ function SparePartsSubAccountView({ mclArea, portalColor, forceSubAccount }: { m
       }
       return true;
     });
-  }, [parts, category, partType, search, statusFilter, truckFilter, tdf.okRow]);
+  }, [periodParts, category, partType, search, statusFilter, truckFilter, tdf.okRow]);
 
   const daysInUse = (p: any): string => {
     if (p.status !== 'in_use' || !p.installed_date) return '—';
@@ -752,6 +760,16 @@ function SparePartsSubAccountView({ mclArea, portalColor, forceSubAccount }: { m
         })}
       </div>
 
+      {/* Date filter: month, week (Saturday → Friday) or a single day */}
+      <div className="flex flex-wrap items-center gap-3">
+        <PeriodBar f={period} showDay />
+        {period.active && (
+          <span className="text-xs text-slate-500">
+            Showing spares for <b className="text-slate-700">{period.periodLabel}</b> ({periodParts.length})
+          </span>
+        )}
+      </div>
+
       {/* Search + filters */}
       <div className="flex flex-col sm:flex-row gap-2">
         <div className="relative flex-1">
@@ -787,7 +805,7 @@ function SparePartsSubAccountView({ mclArea, portalColor, forceSubAccount }: { m
           <EmptyState
             icon={<Package className="h-8 w-8" />}
             title="No spare parts found"
-            message={parts.length === 0 ? 'Get started by adding a part or importing a list.' : 'Nothing matches this tab and filter.'}
+            message={parts.length === 0 ? 'Get started by adding a part or importing a list.' : period.active && periodParts.length === 0 ? `No spares for ${period.periodLabel}.` : 'Nothing matches this tab and filter.'}
           />
         </div>
       ) : (
