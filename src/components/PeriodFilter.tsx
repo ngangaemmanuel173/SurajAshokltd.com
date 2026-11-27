@@ -29,6 +29,7 @@ export interface PeriodOption { value: string; label: string }
 export function usePeriodFilter(dates: unknown[]) {
   const [month, setMonthState] = useState('all');   // 'all' | 'YYYY-MM'
   const [week, setWeek] = useState('all');          // 'all' | Saturday 'YYYY-MM-DD'
+  const [day, setDayState] = useState('');             // '' (any day) | 'YYYY-MM-DD'
 
   const days = useMemo(() => {
     const set = new Set<string>();
@@ -63,32 +64,42 @@ export function usePeriodFilter(dates: unknown[]) {
     return starts.map(w => ({ value: w, label: label(w) }));
   }, [month, days]);
 
-  const setMonth = (m: string) => { setMonthState(m); setWeek('all'); };
-  const clear = () => { setMonthState('all'); setWeek('all'); };
+  // Changing the month or week resets the day, so the three filters never contradict each other.
+  const setMonth = (m: string) => { setMonthState(m); setWeek('all'); setDayState(''); };
+  const setWeekAndResetDay = (w: string) => { setWeek(w); setDayState(''); };
+  // Picking a day also moves the month and week to the ones that day falls in.
+  const setDay = (d: string) => {
+    setDayState(d);
+    if (d) { setMonthState(d.slice(0, 7)); setWeek('all'); }
+  };
+  const clear = () => { setMonthState('all'); setWeek('all'); setDayState(''); };
 
   /** true when a date (YYYY-MM-DD or ISO timestamp) passes the month + week filter */
   const okDate = (value: unknown): boolean => {
-    if (month === 'all' && week === 'all') return true;
+    if (month === 'all' && week === 'all' && !day) return true;
     const d = dayOnly(value);
     if (!d) return false;
     if (month !== 'all' && d.slice(0, 7) !== month) return false;
     if (week !== 'all' && (d < week || d > addDays(week, 6))) return false;
+    if (day && d !== day) return false;
     return true;
   };
 
-  const active = month !== 'all' || week !== 'all';
-  const periodLabel = week !== 'all'
+  const active = month !== 'all' || week !== 'all' || !!day;
+  const periodLabel = day
+    ? parseStr(day).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+    : week !== 'all'
     ? (weekOptions.find(w => w.value === week)?.label ?? 'Selected week')
     : month !== 'all' ? monthLabel(month) : 'All dates';
 
-  return { month, week, setMonth, setWeek, monthOptions, weekOptions, okDate, active, clear, periodLabel };
+  return { month, week, day, setMonth, setWeek: setWeekAndResetDay, setDay, monthOptions, weekOptions, okDate, active, clear, periodLabel };
 }
 
 export type PeriodFilterState = ReturnType<typeof usePeriodFilter>;
 
 const selCls = 'rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-800 outline-none focus:border-slate-500';
 
-export function PeriodBar({ f }: { f: PeriodFilterState }) {
+export function PeriodBar({ f, showDay = false }: { f: PeriodFilterState; showDay?: boolean }) {
   return (
     <div className="flex flex-wrap items-center gap-2">
       <select value={f.month} onChange={e => f.setMonth(e.target.value)} className={`${selCls} min-w-[10rem]`} aria-label="Filter by month">
@@ -99,6 +110,18 @@ export function PeriodBar({ f }: { f: PeriodFilterState }) {
         <option value="all">All weeks</option>
         {f.weekOptions.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
       </select>
+      {showDay && (
+        <input
+          type="date"
+          value={f.day}
+          min={f.month !== 'all' ? `${f.month}-01` : undefined}
+          max={f.month !== 'all' ? monthEnd(f.month) : undefined}
+          onChange={e => f.setDay(e.target.value)}
+          className={selCls}
+          aria-label="Filter by day"
+          title="Filter by a single day"
+        />
+      )}
       {f.active && <button onClick={f.clear} className="text-xs font-medium text-slate-500 underline">Clear dates</button>}
     </div>
   );
