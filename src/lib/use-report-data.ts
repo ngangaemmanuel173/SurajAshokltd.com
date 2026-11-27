@@ -4,6 +4,7 @@ import { getSubAccountFilter } from '@/lib/supabase';
 import { useAuth } from '@/lib/auth';
 import { SubAccount, MCLArea } from '@/lib/portals';
 import { ReportData, ReportFilters } from '@/lib/report-utils';
+import { spareInPeriod } from '@/lib/spareDates';
 
 // Each sub-account reports from its OWN trips table (same tables the Trips page uses).
 // dateField is the column the report period is filtered on.
@@ -114,7 +115,8 @@ export function useReportData(filters: ReportFilters, isMaster: boolean, masterS
       trips: (trips.data || []).map(normalizeTrip),
       fuel: fuel.data || [],
       tallies: tallies.data || [],
-      spareParts: parts.data || [],
+      // Only the spares that belong to the report period (see spareDate): a monthly report lists that month's spares only
+      spareParts: (parts.data || []).filter((p: any) => spareInPeriod(p, from, to)),
       containers: containers.data || [],
       vehicleCompliance: vc.data || [],
       driverCompliance: dc.data || [],
