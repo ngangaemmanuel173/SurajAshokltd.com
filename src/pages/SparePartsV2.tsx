@@ -13,6 +13,7 @@ import { SubAccount, MCLArea } from '@/lib/portals';
 import { BulkImportModal } from '@/components/BulkImportModal';
 import { usePeriodFilter, PeriodBar } from '@/components/PeriodFilter';
 import { spareDate } from '@/lib/spareDates';
+import { BatteryRecordModal, BatteryRecordsList } from '@/components/BatteryRecords';
 
 /* ------------------------------------------------------------------ */
 /* Constants                                                           */
@@ -392,6 +393,15 @@ function SparePartsSubAccountView({ mclArea, portalColor, forceSubAccount }: { m
 
   // Panels / modals
   const [isBulkOpen, setIsBulkOpen] = useState(false);
+  // Battery fitting sheet (24V truck batteries record)
+  const [batteryFormOpen, setBatteryFormOpen] = useState(false);
+  const [batteryView, setBatteryView] = useState<'parts' | 'records'>('parts');
+  const [batteryRefresh, setBatteryRefresh] = useState(0);
+  const [driverNames, setDriverNames] = useState<string[]>([]);
+  useEffect(() => {
+    supabase.from('drivers').select('name').order('name').then((r: any) => setDriverNames((r.data || []).map((d: any) => d.name).filter(Boolean)));
+  }, [subAccount]);
+  const showRecords = category === 'battery' && batteryView === 'records';
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [formOpen, setFormOpen] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -418,7 +428,7 @@ function SparePartsSubAccountView({ mclArea, portalColor, forceSubAccount }: { m
     setLoading(true);
 
     let partsQuery = supabase.from('spare_parts_v2').select('*').order('created_at', { ascending: false });
-    let vehicleQuery = supabase.from('vehicles').select('id, plate_number, sub_account').order('plate_number');
+    let vehicleQuery = supabase.from('vehicles').select('id, plate_number, make, model, sub_account').order('plate_number');
 
     // Sub-account staff only ever see their own sub-account
     partsQuery = (partsQuery as any).eq('sub_account', subAccount);
@@ -693,6 +703,15 @@ function SparePartsSubAccountView({ mclArea, portalColor, forceSubAccount }: { m
         />
         <div className="flex flex-wrap items-center gap-2">
           <>
+              {category === 'battery' && (
+                <button
+                  onClick={() => setBatteryFormOpen(true)}
+                  className="flex items-center gap-2 px-4 py-2.5 text-sm font-medium rounded-lg shadow-sm hover:opacity-90 transition-opacity"
+                  style={primaryBtn}
+                >
+                  <Battery className="h-4 w-4" /> Record Batteries
+                </button>
+              )}
               <button
                 onClick={openAdd}
                 className="flex items-center gap-2 px-4 py-2.5 text-sm font-medium rounded-lg shadow-sm hover:opacity-90 transition-opacity"
@@ -744,11 +763,11 @@ function SparePartsSubAccountView({ mclArea, portalColor, forceSubAccount }: { m
           { key: 'new', label: 'New Spares' },
           { key: 'rebound', label: 'Rebound Spares' },
         ] as { key: PartType; label: string }[]).map(t => {
-          const active = partType === t.key;
+          const active = partType === t.key && !showRecords;
           return (
             <button
               key={t.key}
-              onClick={() => setPartType(t.key)}
+              onClick={() => { setPartType(t.key); setBatteryView('parts'); }}
               className="rounded-full px-4 py-1.5 text-sm font-medium border transition-colors"
               style={active
                 ? { background: portalColor, color: '#fff', borderColor: portalColor }
@@ -758,6 +777,17 @@ function SparePartsSubAccountView({ mclArea, portalColor, forceSubAccount }: { m
             </button>
           );
         })}
+        {category === 'battery' && (
+          <button
+            onClick={() => setBatteryView('records')}
+            className="ml-2 rounded-full px-4 py-1.5 text-sm font-medium border transition-colors"
+            style={showRecords
+              ? { background: portalColor, color: '#fff', borderColor: portalColor }
+              : { background: '#fff', color: '#475569', borderColor: '#cbd5e1' }}
+          >
+            Fitting records
+          </button>
+        )}
       </div>
 
       {/* Date filter: month, week (Saturday → Friday) or a single day */}
@@ -770,6 +800,10 @@ function SparePartsSubAccountView({ mclArea, portalColor, forceSubAccount }: { m
         )}
       </div>
 
+      {showRecords ? (
+        <BatteryRecordsList subAccount={subAccount} refreshKey={batteryRefresh} okDate={period.okDate} />
+      ) : (
+        <>
       {/* Search + filters */}
       <div className="flex flex-col sm:flex-row gap-2">
         <div className="relative flex-1">
@@ -845,6 +879,9 @@ function SparePartsSubAccountView({ mclArea, portalColor, forceSubAccount }: { m
             </tbody>
           </table>
         </div>
+      )}
+
+        </>
       )}
 
       {/* History slide-out panel */}
@@ -1070,6 +1107,18 @@ function SparePartsSubAccountView({ mclArea, portalColor, forceSubAccount }: { m
           </div>
         </div>
       )}
+
+      <BatteryRecordModal
+        open={batteryFormOpen}
+        onClose={() => setBatteryFormOpen(false)}
+        subAccount={subAccount}
+        vehicles={vehicles}
+        drivers={driverNames}
+        performedBy={performedBy}
+        portalColor={portalColor}
+        toast={toast}
+        onSaved={() => { setBatteryRefresh(n => n + 1); loadData(); }}
+      />
 
       <BulkImportModal
           open={isBulkOpen}
